@@ -14,6 +14,8 @@ The Chameleon dataset is available on 🤗 [Hugging Face](https://huggingface.co
 </div>
 
 To run a segmentation demo, open the Jupyter Notebook `chameleon_segmentation.ipynb`.
+> The code has been tested on an Intel Core i5-12400 machine with 64 GB of RAM and an NVIDIA GeForce GTX 1080Ti GPU.
+> Python 3.11 is required.
 
 ## Repository Organization
 
@@ -86,7 +88,7 @@ Replace `<sub_dataset>` with `BASE`, `DFS`, `RD`, `MRP`, `CHF`.
 The dataset is divided per hiding countermeasure. Each file has the following structure:
 * **Data:** The data are power traces of 134,217,550 time samples.
  BASE, DFS, RD, MRP, and CHF sub-dataset
- contain 256, 256, 512, 512, 1024, and 256 data respectively.
+ contain 256, 256, 512, 512, and 1024 data respectively.
  The traces capture the SoC execution of AES encryptions interleaved with general-purpose applications.
 * **Metadata:** The metadata are divided into three groups:
   * **Ciphers:** This group contains the AES inputs:
