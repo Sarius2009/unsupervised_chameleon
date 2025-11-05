@@ -1,7 +1,7 @@
 datamodule:
   name: CpClassifierDataModule
   config:
-    dataset_dir:  </path/to/chameleon/base/dataset>
+    dataset_dir:  datasets/BASE/
     batch_size: 256
     num_workers: 8
     labels:
