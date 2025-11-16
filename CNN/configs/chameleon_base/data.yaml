@@ -1,9 +1,9 @@
 datamodule:
   name: CpClassifierDataModule
   config:
-    dataset_dir:  datasets/BASE/
+    dataset_dir:  temporary_files
     batch_size: 256
-    num_workers: 8
+    num_workers: 0
     labels:
       0: 0 # aes other
       1: 1 # aes first

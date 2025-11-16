@@ -143,7 +143,8 @@ def _dataLoader(chunk_files):
 def createSubsets(dataset_dir: str,
                   out_data_dir: str,
                   window_size: int = 10_000,
-                  split_traces: float = 0.8):
+                  split_traces: float = 0.8,
+                  reuse_existing_dataset: bool = True):
     '''
     Create subsets for training and testing a CNN from the Chameleon dataset.
 
@@ -159,9 +160,8 @@ def createSubsets(dataset_dir: str,
         The proportion of traces to use for training (default is 0.8).
     '''
 
-    # Get all traces files ----------------------
-    traces_files = _getFilePathes(dataset_dir)
-    # -------------------------------------------------------------------------------------------------------------
+
+
     if not os.path.exists(out_data_dir):
         os.makedirs(out_data_dir)
     # -------------------------------------------
@@ -172,6 +172,13 @@ def createSubsets(dataset_dir: str,
     valid_tar_path = os.path.join(out_data_dir, 'valid_labels.npy')
     test_set_path = os.path.join(out_data_dir, 'test_set.npy')
     test_tar_path = os.path.join(out_data_dir, 'test_labels.npy')
+
+    if reuse_existing_dataset and os.path.exists(train_set_path) and os.path.exists(train_tar_path) and os.path.exists(valid_set_path) and os.path.exists(valid_tar_path) and os.path.exists(test_set_path) and os.path.exists(test_tar_path):
+        return
+
+    # Get all traces files ----------------------
+    traces_files = _getFilePathes(dataset_dir)
+    # -------------------------------------------------------------------------------------------------------------
 
     with NpyAppendArray(train_set_path, delete_if_exists=True) as npa_train_set, \
             NpyAppendArray(train_tar_path, delete_if_exists=True) as npa_train_tar,  \

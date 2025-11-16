@@ -31,22 +31,46 @@ def removeFalsePositives_basic(COstarts: list, COends: list) -> tuple:
 
     starts, ends = [], []
     i, j = 0, 0
-    while i < len(COstarts)-1 and j < len(COends)-1:
+
+    # If there are fewer than 2 starts or ends, nothing to merge/filter
+    if len(COstarts) < 2 or len(COends) < 2:
+        return COstarts[:], COends[:]
+
+    while i < len(COstarts) - 1 and j < len(COends) - 1:
         starts.append(COstarts[i])
-        if COstarts[i] < COends[j] and \
-                COstarts[i+1] >= COends[j]:
+
+        # Safely check the next start index
+        if (
+            i + 1 < len(COstarts)
+            and COstarts[i] < COends[j]
+            and COstarts[i + 1] >= COends[j]
+        ):
             i += 1
         else:
             i += 2
+
+        # If we ran out of start indices, stop processing pairs
+        if i >= len(COstarts):
+            break
+
         ends.append(COends[j])
-        if COstarts[i] >= COends[j] and \
-                COstarts[i] < COends[j+1]:
+
+        # Safely check the next end index
+        if (
+            j + 1 < len(COends)
+            and COstarts[i] >= COends[j]
+            and COstarts[i] < COends[j + 1]
+        ):
             j += 1
         else:
             j += 2
 
-    starts.extend(COstarts[i:])
-    ends.extend(COends[j:])
+    # Append any remaining unprocessed starts/ends
+    if i < len(COstarts):
+        starts.extend(COstarts[i:])
+    if j < len(COends):
+        ends.extend(COends[j:])
+
     return starts, ends
 
 

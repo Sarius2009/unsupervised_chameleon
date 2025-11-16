@@ -1,3 +1,5 @@
 /.idea/
 /datasets/
 /temporary_files/
+/.neptune/
+/lightning_logs/

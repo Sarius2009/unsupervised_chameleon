@@ -49,7 +49,7 @@ def train(config_dir: str,
 
     # Seed Everything
     # ---------------
-    pl.seed_everything(exp_config['seed'], workers=True)
+    pl.seed_everything(exp_config['seed'], workers=False)
     # ---------------
 
     # Build Lightning Module
