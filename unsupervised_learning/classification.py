@@ -1,7 +1,9 @@
 import numpy as np
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.decomposition import PCA, FastICA
 
 class BaseClassifier:
+    def __init__(self):
+        self.fit_per_trace = False
     def fit(self, X_batch: np.ndarray) -> np.ndarray:
         return self
     def predict(self, X_batch: np.ndarray) -> np.ndarray:
@@ -84,6 +86,7 @@ class KMeansClassifier(BaseClassifier):
                  random_state: int | None = 42,
                  algorithm: str = "lloyd",
                  temperature: float = 1.0):
+        super().__init__()
         self.n_init = n_init
         self.max_iter = max_iter
         self.tol = tol

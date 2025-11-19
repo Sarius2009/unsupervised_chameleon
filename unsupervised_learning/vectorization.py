@@ -16,9 +16,11 @@ from tsfresh.feature_extraction.settings import (
 from tsfresh.utilities.dataframe_functions import impute as tsf_impute
 
 class BaseVectorizer:
-    """Vectorizers must expose: fit(batch), transform(batch)."""
+    """Vectorizers must expose: partial_fit(batch), transform(batch)."""
+    def __init__(self):
+        self.needs_two_pass = False
 
-    def fit(self, x: np.ndarray):
+    def partial_fit(self, x: np.ndarray):
         """Optional fit; no-op by default to support pure-transform vectorizers."""
         return self
 
@@ -49,6 +51,7 @@ class TSFreshVectorizer(BaseVectorizer):
         impute: bool = True,
         n_jobs: int = 0,
     ):
+        super().__init__()
         self.impute = impute
         self.n_jobs = n_jobs
 

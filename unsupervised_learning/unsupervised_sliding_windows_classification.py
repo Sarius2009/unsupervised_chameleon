@@ -160,34 +160,74 @@ def classifyTrace_unsupervised(
         If classifier has predict_proba, scores are soft probabilities.
         Otherwise, scores are one-hot encodings of predicted labels. (Not sure if this works with the further code)
     """
-    traces = _dataLoader(trace_file)
-    total_traces = 0
+
     with h5py.File(trace_file, "r", libver="latest") as hf_chunk:
         total_traces = len(hf_chunk["metadata/ciphers/"].keys())
 
-    all_scores = []
-    for trace in tqdm(traces, colour="green", total=total_traces):
+    # Optional first pass to train vectorizer
+    if vectorizer.needs_two_pass:
+        # Collect all raw windows, vectorizer.partial_fit on batches
+        for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="yellow", desc="Vectorizer first pass"):
+            trace = highpass(trace, 0.001)
+            trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
+
+            for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
+                windows_arr = np.asarray(windows_batch)
+                vectorizer.partial_fit(windows_arr)
+
+
+    per_trace_feats = []
+    per_trace_scores = []
+    # Vectorize all traces (and classify if you can't store all vectors)
+    for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="green", desc="Vectorizing and classifying traces"):
         trace = highpass(trace, 0.001)
         trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
 
-        # 1) iterate over window batches and vectorize
         feats_batches = []
 
         for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
-            windows_arr = np.asarray(windows_batch)  # (B, window_size)
-            feats_batch = vectorizer.transform(windows_arr)  # (B, D)
+            windows_arr = np.asarray(windows_batch)
+            feats_batch = vectorizer.transform(windows_arr)  # shape (batch, D)
             feats_batches.append(feats_batch)
 
-        X = np.vstack(feats_batches)  # (N_windows, D)
+        X = np.vstack(feats_batches) if feats_batches else np.zeros((0, 0))
 
-        # 2) fit classifier on this trace's window vectors
-        classifier.fit(X)
+        if classifier.fit_per_trace:
+            if X.shape[0] == 0:
+                # consistent empty output shape
+                scores = np.zeros((0,3))
+            else:
+                classifier.fit(X)
+                if hasattr(classifier, "predict_proba"):
+                    scores = classifier.predict_proba(X)
+                else:
+                    scores = classifier.predict(X)
 
-        # 3) labels per window
-        if hasattr(classifier, "predict_proba"):
-            scores = classifier.predict_proba(X)
+            per_trace_scores.append(scores)
+
         else:
-            scores = classifier.predict(X)  # (N_windows,)
-        all_scores.append(scores)
+            per_trace_feats.append(X)
 
-    return np.stack(all_scores, axis=0)
+    # Train classifier on all features from file, should be default
+    if not classifier.fit_per_trace:
+        all_X = np.vstack(per_trace_feats) if len(per_trace_feats) else np.zeros((0, 0))
+
+        if all_X.shape[0] > 0:
+            classifier.fit(all_X)
+
+
+        for X in tqdm(per_trace_feats, colour="cyan", desc="Classifying globally-fitted"):
+            if X.shape[0] == 0:
+                per_trace_scores.append(np.zeros((0, 3)))
+                continue
+
+            if hasattr(classifier, "predict_proba"):
+                scores = classifier.predict_proba(X)
+            else:
+                labels = classifier.predict(X)
+                scores = labels
+
+            per_trace_scores.append(scores)
+
+
+    return np.stack(per_trace_scores, axis=0)
