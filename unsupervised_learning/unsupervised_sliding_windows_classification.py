@@ -179,7 +179,7 @@ def classifyTrace_unsupervised(
     per_trace_feats = []
     per_trace_scores = []
     # Vectorize all traces (and classify if you can't store all vectors)
-    for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="green", desc="Vectorizing and classifying traces"):
+    for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="green", desc="Vectorizing traces" + (" and classifying" if classifier.fit_per_trace else "")):
         trace = highpass(trace, 0.001)
         trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
 
@@ -190,7 +190,7 @@ def classifyTrace_unsupervised(
             feats_batch = vectorizer.transform(windows_arr)  # shape (batch, D)
             feats_batches.append(feats_batch)
 
-        X = np.vstack(feats_batches) if feats_batches else np.zeros((0, 0))
+        X = np.vstack(feats_batches)
 
         if classifier.fit_per_trace:
             if X.shape[0] == 0:
