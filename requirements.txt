@@ -14,3 +14,5 @@ torchmetrics~=1.4.0.post0
 picosdk
 h5py
 tsfresh
+umap-learn
+tensorflow

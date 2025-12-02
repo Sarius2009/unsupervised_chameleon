@@ -1,9 +1,19 @@
 import numpy as np
 from sklearn.decomposition import PCA, FastICA
+from sklearn.pipeline import Pipeline
+from umap import UMAP
+
 
 class BaseClassifier:
     def __init__(self):
         self.fit_per_trace = False
+        self.pipeline_ = Pipeline([
+            ("selector", VarianceThreshold(threshold=1e-4)),
+            ("scaler", StandardScaler()),
+            ("pca", PCA(n_components=0.95)),
+            #("umap", UMAP(n_components=10, n_neighbors=15, min_dist=0.3, verbose=True)),
+            #("ica", FastICA(n_components=30))
+        ])
     def fit(self, X_batch: np.ndarray) -> np.ndarray:
         return self
     def predict(self, X_batch: np.ndarray) -> np.ndarray:
@@ -18,21 +28,6 @@ from sklearn.metrics import pairwise_distances
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import VarianceThreshold
-
-
-def _prepare_data(X: np.ndarray) -> np.ndarray:
-    if X.ndim != 2:
-        raise ValueError(f"X must be 2D (N, D); got shape {X.shape}")
-
-    # 1. Remove low-variance features
-    selector = VarianceThreshold(threshold=1e-4)
-    X = selector.fit_transform(X)
-
-    # 2. Scale
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
-    # TODO test PCA/ICA
-    return X
 
 
 class KMeansClassifier(BaseClassifier):
@@ -102,7 +97,9 @@ class KMeansClassifier(BaseClassifier):
 
     # ---- BaseUnsupervisedClassifier API ----
     def fit(self, X: np.ndarray):
-        X = _prepare_data(X)
+        orig_features = X.shape[1]
+        X = self.pipeline_.fit_transform(X)
+        print(f"Feature dimension after pipeline: {X.shape[1]}/{orig_features}")
 
         self.kmeans_ = KMeans(
             n_clusters=3,
@@ -132,7 +129,7 @@ class KMeansClassifier(BaseClassifier):
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         self._check_is_fitted()
-        X = _prepare_data(X)
+        X = self.pipeline_.transform(X)
         clusters = self.kmeans_.predict(X)
         # Map cluster indices to size-ordered classes
         to_class = np.vectorize(self.cluster_to_class_.get)
@@ -144,7 +141,7 @@ class KMeansClassifier(BaseClassifier):
         Columns are ordered [0, 1, 2] regardless of internal KMeans labels.
         """
         self._check_is_fitted()
-        X = _prepare_data(X)
+        X = self.pipeline_.transform(X)
         # Distances to original KMeans cluster indices (columns 0..2 correspond to those)
         d = pairwise_distances(X, self.centroids_, metric="euclidean")  # (N, 3)
 

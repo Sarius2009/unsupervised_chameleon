@@ -4,11 +4,11 @@ Authors :
     Davide Galli (davide.galli@polimi.it),
     Davide Zoni (davide.zoni@polimi.it)
 """
-
+import gc
 import os
-from math import ceil
+from time import sleep
 
-from tqdm.auto import tqdm
+from tqdm import tqdm
 import numpy as np
 
 
@@ -16,14 +16,12 @@ from CNN.build_dataset_chameleon import highpass
 import h5py
 
 # Unsupervised components (vectorization + clustering)
-from unsupervised_learning.vectorization import (
-    BaseVectorizer,
-    TSFreshVectorizer,
-)
-from unsupervised_learning.classification import (
-    BaseClassifier,
-    KMeansClassifier,
-)
+from unsupervised_learning.vectorization import BaseVectorizer
+from unsupervised_learning.classification import BaseClassifier
+
+import sys
+import numpy as np
+
 
 
 def saveClassification(segmentation: np.ndarray, output_file: str) -> None:
@@ -133,7 +131,9 @@ def classifyTrace_unsupervised(
     classifier: BaseClassifier,
     stride: int,
     window_size: int,
-    batch_size: int = 8192,
+    tmp_folder,
+    batch_size: int = 20000,
+    stored_features_path: str = None
 ) -> np.ndarray:
     """
     Unsupervised sliding-window classification using a vectorizer and
@@ -142,6 +142,9 @@ def classifyTrace_unsupervised(
 
     Parameters
     ----------
+    stored_features_path
+    tmp_folder
+    skip_feature_extraction
     trace_file : str
         Path to HDF5 trace file (same format used in CNN pipeline).
     vectorizer : BaseVectorizer
@@ -164,70 +167,136 @@ def classifyTrace_unsupervised(
     with h5py.File(trace_file, "r", libver="latest") as hf_chunk:
         total_traces = len(hf_chunk["metadata/ciphers/"].keys())
 
-    # Optional first pass to train vectorizer
-    if vectorizer.needs_two_pass:
-        # Collect all raw windows, vectorizer.partial_fit on batches
-        for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="yellow", desc="Vectorizer first pass"):
+    per_trace_scores = []
+    feat_files = []          # list of npy file paths for each trace
+    if stored_features_path is None:
+        # Optional first pass to train vectorizer
+        if vectorizer.needs_two_pass:
+            # Collect all raw windows, vectorizer.partial_fit on batches
+            for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="yellow", desc="Vectorizer first pass"):
+                trace = highpass(trace, 0.001)
+                trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
+
+                for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
+                    windows_arr = np.asarray(windows_batch)
+                    vectorizer.partial_fit(windows_arr)
+
+
+
+        feat_dim = None          # feature dimension (D)
+        # Vectorize all traces (and classify if you can't store all vectors)
+        for trace_idx, trace in enumerate(tqdm(_dataLoader(trace_file), total=total_traces, colour="green", desc="Vectorizing traces" + (" and classifying" if classifier.fit_per_trace else ""))):
             trace = highpass(trace, 0.001)
             trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
 
+            feats_batches = []
+
             for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
                 windows_arr = np.asarray(windows_batch)
-                vectorizer.partial_fit(windows_arr)
+                feats_batch = vectorizer.transform(windows_arr)  # shape (batch, D)
+                feats_batches.append(feats_batch)
 
+            X = np.vstack(feats_batches)
 
-    per_trace_feats = []
-    per_trace_scores = []
-    # Vectorize all traces (and classify if you can't store all vectors)
-    for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="green", desc="Vectorizing traces" + (" and classifying" if classifier.fit_per_trace else "")):
-        trace = highpass(trace, 0.001)
-        trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
-
-        feats_batches = []
-
-        for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
-            windows_arr = np.asarray(windows_batch)
-            feats_batch = vectorizer.transform(windows_arr)  # shape (batch, D)
-            feats_batches.append(feats_batch)
-
-        X = np.vstack(feats_batches)
-
-        if classifier.fit_per_trace:
-            if X.shape[0] == 0:
-                # consistent empty output shape
-                scores = np.zeros((0,3))
-            else:
-                classifier.fit(X)
-                if hasattr(classifier, "predict_proba"):
-                    scores = classifier.predict_proba(X)
+            if classifier.fit_per_trace:
+                if X.shape[0] == 0:
+                    # consistent empty output shape
+                    scores = np.zeros((0,3))
                 else:
-                    scores = classifier.predict(X)
+                    classifier.fit(X)
+                    if hasattr(classifier, "predict_proba"):
+                        scores = classifier.predict_proba(X)
+                    else:
+                        scores = classifier.predict(X)
 
-            per_trace_scores.append(scores)
+                per_trace_scores.append(scores)
 
-        else:
-            per_trace_feats.append(X)
+            else:
+                # Store features for this trace on disk instead of in RAM
+                trace_feat_path = os.path.join(
+                    tmp_folder, f"trace_{trace_idx}_feats.npy"
+                )
+                np.save(trace_feat_path, X)
 
-    # Train classifier on all features from file, should be default
+                feat_files.append(trace_feat_path)
+                if X.shape[0] > 0:
+                    feat_dim = X.shape[1] if feat_dim is None else feat_dim
+            del X, feats_batch, trace, windows_batch
+            gc.collect()
+            sleep(20)
+            gc.collect()
+            sleep(20)
+            gc.collect()
+    else:
+        for i in range(0, 16):
+            trace_feat_path = os.path.join(
+                tmp_folder, stored_features_path, f"trace_{i}_feats.npy"
+            )
+            feat_files.append(trace_feat_path)
+
+    # Train classifier on all features from file (global fit)
     if not classifier.fit_per_trace:
-        all_X = np.vstack(per_trace_feats) if len(per_trace_feats) else np.zeros((0, 0))
 
-        if all_X.shape[0] > 0:
-            classifier.fit(all_X)
+        # Create a disk-backed memmap for all features
+        # Before creating the memmap
 
+        total_rows = 0
+        feat_dim = None
+        feat_dtype = None
 
-        for X in tqdm(per_trace_feats, colour="cyan", desc="Classifying globally-fitted"):
-            if X.shape[0] == 0:
-                per_trace_scores.append(np.zeros((0, 3)))
+        for path in feat_files:
+            Xi = np.load(path, mmap_mode='r')  # memory-mapped, cheap
+            if Xi.size == 0:
                 continue
 
+            n_rows, d = Xi.shape
+            total_rows += n_rows
+
+            if feat_dim is None:
+                feat_dim = d
+            if feat_dtype is None:
+                feat_dtype = Xi.dtype
+
+        # Now you have total_rows, feat_dim and dtype
+        all_feats_path = os.path.join(tmp_folder, "all_feats.dat")
+        all_X = np.memmap(
+            all_feats_path,
+            dtype=feat_dtype,   # matches saved features
+            mode="w+",
+            shape=(total_rows, feat_dim),
+        )
+
+
+# Fill memmap by streaming per-trace features from disk
+        offset = 0
+        for path in tqdm(
+                feat_files,
+                total=len(feat_files),
+                colour="magenta",
+                desc="Building all_X memmap",
+        ):
+            Xi = np.load(path).astype(np.float32, copy=False)  # load per-trace features
+            n_rows = Xi.shape[0]
+            all_X[offset : offset + n_rows, :] = Xi
+            offset += n_rows
+
+        # Fit classifier on disk-backed array
+        classifier.fit(all_X)
+
+        # Second pass: classify per trace by loading back each X from file
+        for path in tqdm(
+                feat_files,
+                total=len(feat_files),
+                colour="cyan",
+                desc="Classifying globally-fitted",
+        ):
+
+            X = np.load(path)
             if hasattr(classifier, "predict_proba"):
                 scores = classifier.predict_proba(X)
             else:
-                labels = classifier.predict(X)
-                scores = labels
+                scores = classifier.predict(X)
 
             per_trace_scores.append(scores)
-
 
     return np.stack(per_trace_scores, axis=0)
