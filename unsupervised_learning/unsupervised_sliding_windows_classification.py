@@ -15,6 +15,7 @@ import numpy as np
 from CNN.build_dataset_chameleon import highpass
 import h5py
 
+from inference_pipeline.debug import loaderGt
 # Unsupervised components (vectorization + clustering)
 from unsupervised_learning.vectorization import BaseVectorizer
 from unsupervised_learning.classification import BaseClassifier
@@ -280,10 +281,32 @@ def classifyTrace_unsupervised(
             all_X[offset : offset + n_rows, :] = Xi
             offset += n_rows
 
-        # Fit classifier on disk-backed array
-        classifier.fit(all_X)
+        # Fit  on disk-backed array
+        all_labels = []
+        offset = 0
+        for trace_idx, path in enumerate(feat_files):
+            Xi = np.load(path)              # shape (n_windows_i, D)
 
-        # Second pass: classify per trace by loading back each X from file
+            # load pinpoints for this trace
+            with h5py.File(trace_file, "r", libver="latest") as hf:
+                pinpoints = hf[f"metadata/pinpoints/pinpoints_{trace_idx}"][:]
+                trace_len = hf[f"data/traces/trace_{trace_idx}"].shape[0]
+
+            labels_i = _window_labels_from_pinpoints(
+                trace_len=trace_len,
+                pinpoints=pinpoints,
+                window_size=window_size,
+                stride=stride,
+            )
+            assert labels_i.shape[0] == Xi.shape[0]
+
+            all_labels.append(labels_i)
+
+        labels = np.concatenate(all_labels).astype(int)
+        classifier.fit(all_X, labels)
+
+
+# Second pass: classify per trace by loading back each X from file
         for path in tqdm(
                 feat_files,
                 total=len(feat_files),
@@ -300,3 +323,50 @@ def classifyTrace_unsupervised(
             per_trace_scores.append(scores)
 
     return np.stack(per_trace_scores, axis=0)
+
+
+def _window_labels_from_pinpoints(
+        trace_len: int,
+        pinpoints: np.ndarray,  # shape (N_co, 2) with columns [start, end]
+        window_size: int,
+        stride: int,
+) -> np.ndarray:
+    """
+    Compute per-window class labels {0,1,2} from CO pinpoints.
+    - class 0: last window containing 'start'
+    - class 1: windows after that until first window containing 'end'
+    - class 2: everything else
+    """
+    # number of windows you actually use (matches _extract_fixed_windows)
+    num_windows = (trace_len - window_size) // stride + 1
+    labels = np.full(num_windows, 2, dtype=int)  # default: class 2
+
+    win_starts = np.arange(num_windows) * stride
+    win_ends = win_starts + window_size
+
+    for s, e in pinpoints:
+        s = int(s)
+        e = int(e)
+
+        # windows containing start
+        start_mask = (win_starts <= s) & (s < win_ends)
+        start_idxs = np.where(start_mask)[0]
+        if start_idxs.size == 0:
+            continue
+        start_win = start_idxs[-1]          # last window containing start
+        labels[start_win] = 0
+
+        # windows containing end
+        end_mask = (win_starts <= e) & (e < win_ends)
+        end_idxs = np.where(end_mask)[0]
+        if end_idxs.size == 0:
+            continue
+        end_first = end_idxs[0]             # first window containing end
+
+        # middle windows strictly between these two
+        mid_start = start_win + 1
+        mid_end = max(mid_start, end_first)
+        if mid_start < mid_end:
+            labels[mid_start:mid_end] = 1
+
+    return labels

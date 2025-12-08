@@ -16,6 +16,7 @@ from tsfresh.feature_extraction.settings import (
     ComprehensiveFCParameters,
 )
 from tsfresh.utilities.dataframe_functions import impute as tsf_impute
+os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 from tensorflow.keras import layers, models, optimizers
 
 
@@ -126,8 +127,9 @@ class AutoencoderVectorizer(BaseVectorizer):
        - latent vector (optional)
     """
 
-    def __init__(self, window_size, latent_dim=32, include_latent=True):
+    def __init__(self, window_size, latent_dim=16, include_latent=True):
         super().__init__()
+        self.batch_data_points = 500_000_000
         self.window_size = window_size
         self.latent_dim = latent_dim
         self.include_latent = include_latent
