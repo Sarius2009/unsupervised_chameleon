@@ -8,6 +8,8 @@ import gc
 import os
 from time import sleep
 
+import torch
+from torch import nn
 from tqdm import tqdm
 import numpy as np
 
@@ -132,8 +134,9 @@ def classifyTrace_unsupervised(
     classifier: BaseClassifier,
     stride: int,
     window_size: int,
+    epochs,
     tmp_folder,
-    batch_size: int = 20000,
+    batch_size: int = 2000,
     stored_features_path: str = None
 ) -> np.ndarray:
     """
@@ -174,13 +177,14 @@ def classifyTrace_unsupervised(
         # Optional first pass to train vectorizer
         if vectorizer.needs_two_pass:
             # Collect all raw windows, vectorizer.partial_fit on batches
-            for trace in tqdm(_dataLoader(trace_file), total=total_traces, colour="yellow", desc="Vectorizer first pass"):
-                trace = highpass(trace, 0.001)
-                trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
-
-                for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
-                    windows_arr = np.asarray(windows_batch)
-                    vectorizer.partial_fit(windows_arr)
+            _train_autoencoder(
+                vectorizer=vectorizer,
+                trace_file=trace_file,
+                window_size=window_size,
+                stride=stride,
+                batch_size=batch_size,
+                epochs=epochs,        # or 2, 3, ... as you like
+            )
 
 
 
@@ -200,6 +204,7 @@ def classifyTrace_unsupervised(
             X = np.vstack(feats_batches)
 
             if classifier.fit_per_trace:
+                raise NotImplementedError('Per trace fitting was not updated')
                 if X.shape[0] == 0:
                     # consistent empty output shape
                     scores = np.zeros((0,3))
@@ -228,6 +233,10 @@ def classifyTrace_unsupervised(
             gc.collect()
             sleep(20)
             gc.collect()
+        if hasattr(vectorizer, "global_avg_error"):
+            print('Avg. reconstruction error:', vectorizer.global_avg_error)
+            with open('loss.txt', 'w') as f:
+                f.write(str(vectorizer.global_avg_error))
     else:
         for i in range(0, 16):
             trace_feat_path = os.path.join(
@@ -268,7 +277,7 @@ def classifyTrace_unsupervised(
         )
 
 
-# Fill memmap by streaming per-trace features from disk
+        # Fill memmap by streaming per-trace features from disk
         offset = 0
         for path in tqdm(
                 feat_files,
@@ -292,7 +301,7 @@ def classifyTrace_unsupervised(
                 pinpoints = hf[f"metadata/pinpoints/pinpoints_{trace_idx}"][:]
                 trace_len = hf[f"data/traces/trace_{trace_idx}"].shape[0]
 
-            labels_i = _window_labels_from_pinpoints(
+            labels_i = window_labels_from_pinpoints(
                 trace_len=trace_len,
                 pinpoints=pinpoints,
                 window_size=window_size,
@@ -305,68 +314,178 @@ def classifyTrace_unsupervised(
         labels = np.concatenate(all_labels).astype(int)
         classifier.fit(all_X, labels)
 
-
+        metrics = []
 # Second pass: classify per trace by loading back each X from file
-        for path in tqdm(
+        metrics = []
+
+        for trace_idx, path in enumerate(tqdm(
                 feat_files,
                 total=len(feat_files),
                 colour="cyan",
                 desc="Classifying globally-fitted",
-        ):
-
+        )):
             X = np.load(path)
+
             if hasattr(classifier, "predict_proba"):
                 scores = classifier.predict_proba(X)
             else:
                 scores = classifier.predict(X)
 
             per_trace_scores.append(scores)
+            metrics.append(window_metrics_from_scores(scores, all_labels[trace_idx]))
+
+
+    print(f'Precicion: {np.mean([m["precision"] for m in metrics], axis=0):.4f}')
+    print(f'Recall: {np.mean([m["recall"] for m in metrics], axis=0):.4f}')
+    print(f'F1: {np.mean([m["f1"] for m in metrics], axis=0):.4f}')
+    print(f'Balanced accuracy: {np.mean([m["balanced_accuracy"] for m in metrics], axis=0):.4f}')
+    if hasattr(classifier, "cluster_to_class_"):
+        print(f'Cluster-to-class mapping: {classifier.cluster_to_class_}')
 
     return np.stack(per_trace_scores, axis=0)
 
 
-def _window_labels_from_pinpoints(
+
+def window_labels_from_pinpoints(
         trace_len: int,
-        pinpoints: np.ndarray,  # shape (N_co, 2) with columns [start, end]
+        pinpoints: np.ndarray,  # shape (N, 2) with columns [start, end]
         window_size: int,
         stride: int,
 ) -> np.ndarray:
     """
-    Compute per-window class labels {0,1,2} from CO pinpoints.
-    - class 0: last window containing 'start'
-    - class 1: windows after that until first window containing 'end'
-    - class 2: everything else
+    Output binary window labels:
+    - 1 if at least 50% of the window is continuously inside [start, end]
+      for any pinpoint interval
+    - 0 otherwise
     """
-    # number of windows you actually use (matches _extract_fixed_windows)
     num_windows = (trace_len - window_size) // stride + 1
-    labels = np.full(num_windows, 2, dtype=int)  # default: class 2
+    labels = np.zeros(num_windows, dtype=int)
 
     win_starts = np.arange(num_windows) * stride
     win_ends = win_starts + window_size
+    min_overlap = 0.45 * window_size
 
     for s, e in pinpoints:
         s = int(s)
         e = int(e)
 
-        # windows containing start
-        start_mask = (win_starts <= s) & (s < win_ends)
-        start_idxs = np.where(start_mask)[0]
-        if start_idxs.size == 0:
-            continue
-        start_win = start_idxs[-1]          # last window containing start
-        labels[start_win] = 0
+        # overlap length between each window and [s, e]
+        overlap = np.minimum(win_ends, e) - np.maximum(win_starts, s)
 
-        # windows containing end
-        end_mask = (win_starts <= e) & (e < win_ends)
-        end_idxs = np.where(end_mask)[0]
-        if end_idxs.size == 0:
-            continue
-        end_first = end_idxs[0]             # first window containing end
+        # continuous overlap must be >= 50% of window
+        mask = overlap >= min_overlap
+        labels[mask] = 1
 
-        # middle windows strictly between these two
-        mid_start = start_win + 1
-        mid_end = max(mid_start, end_first)
-        if mid_start < mid_end:
-            labels[mid_start:mid_end] = 1
+    #print(np.count_nonzero(labels == 0) / len(labels), 'noise windows found')
 
     return labels
+
+
+def _train_autoencoder(
+        vectorizer,
+        trace_file: str,
+        window_size: int,
+        stride: int,
+        batch_size: int,
+        epochs: int = 1,
+):
+    with h5py.File(trace_file, "r", libver="latest") as hf_chunk:
+        total_traces = len(hf_chunk["metadata/ciphers/"].keys())
+
+    runs = 1
+    for epoch in range(epochs):
+        if hasattr(vectorizer, "on_epoch_start"):
+            vectorizer.on_epoch_start(epoch)
+
+        pbar = tqdm(
+            _dataLoader(trace_file),
+            total=total_traces,
+            colour="yellow",
+            desc=f"Autoencoder epoch {epoch+1}/{epochs}",
+            dynamic_ncols=True
+        )
+        if hasattr(vectorizer, "global_avg_error"):
+            old = vectorizer.global_avg_error
+
+        for trace in pbar:
+
+            # -----------------------------
+            # Preprocessing
+            # -----------------------------
+            trace = highpass(trace, 0.001)
+            trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
+
+            # -----------------------------
+            # Train on all windows in trace
+            # -----------------------------
+            subsample_mul = 1
+            if hasattr(vectorizer, "subsample_fraction"):
+                subsample_mul = 1/vectorizer.subsample_fraction
+            for windows_batch in _extract_fixed_windows(trace, window_size, stride, int(batch_size*subsample_mul)):
+                windows_arr = np.asarray(windows_batch, dtype="float32")
+                for i in range(runs):
+                    vectorizer.partial_fit(windows_arr)
+                    if runs > 1 and (i%100 == 0 or i == runs-1):
+                        print(f'Error at {i+1}/{runs}: {vectorizer.global_avg_error:.3f}')
+                runs = max(1, int(runs*0.9))
+                if runs < 200:
+                    runs = 1
+
+
+            # -----------------------------
+            # Store the error after this trace
+            # -----------------------------
+            if hasattr(vectorizer, "global_avg_error"):
+
+                pbar.set_postfix({
+                    "old_avg_err": f"{old:.4f}",
+                    "avg_err": f"{vectorizer.global_avg_error:.4f}",
+                })
+                old = vectorizer.global_avg_error
+
+        if hasattr(vectorizer, "on_epoch_end"):
+            vectorizer.on_epoch_end(epoch)
+
+
+def window_metrics_from_scores(scores, y_true, positive_class=1, threshold=0.5):
+    y_true = np.asarray(y_true, dtype=int)
+    scores = np.asarray(scores)
+
+    if scores.ndim == 2:
+        # scores are probabilities (N,2) in class order [0,1]
+        y_prob_pos = scores[:, positive_class]
+
+        # hard predictions from probability threshold
+        y_pred = (y_prob_pos >= threshold).astype(int)
+
+        y_score = y_prob_pos  # keep for PR/AUC later
+    else:
+        # scores are hard labels (N,)
+        y_pred = scores.astype(int)
+        y_score = None
+
+    TP = np.count_nonzero((y_true == 1) & (y_pred == 1))
+    FP = np.count_nonzero((y_true == 0) & (y_pred == 1))
+    TN = np.count_nonzero((y_true == 0) & (y_pred == 0))
+    FN = np.count_nonzero((y_true == 1) & (y_pred == 0))
+
+    precision = TP / (TP + FP) if (TP + FP) else 0.0
+    recall    = TP / (TP + FN) if (TP + FN) else 0.0
+    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    bal_acc   = 0.5 * (
+            (TP / (TP + FN) if (TP + FN) else 0.0) +
+            (TN / (TN + FP) if (TN + FP) else 0.0)
+    )
+
+    return {
+        "TP": TP, "FP": FP, "TN": TN, "FN": FN,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "balanced_accuracy": bal_acc,
+        "y_score": y_score,
+    }
+
+
+
+

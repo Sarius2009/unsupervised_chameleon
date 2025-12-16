@@ -76,9 +76,9 @@ def extractEdges(square_signal: np.ndarray) -> np.ndarray:
         starts.append(1)
 
     for i in range(1, len(square_signal)):
-        if square_signal[i] == 1 and square_signal[i - 1] != 1:
+        if square_signal[i] == 1 and square_signal[i - 1] != 1: # Wechsel auf 1 (CO_mid)
             starts.append(i+1)
-        if (square_signal[i] == 2 and square_signal[i - 1] != 2) or (square_signal[i] == 1 and square_signal[i - 1] == 0):
+        if (square_signal[i] == 2 and square_signal[i - 1] != 2) or (square_signal[i] == 1 and square_signal[i - 1] == 0): # Wechsel auf 2 (Noise) oder wechsel von 1 (CO_mid) auf 0 (CO_start)
             ends.append(i)
 
     return np.asarray(starts), np.asarray(ends)

@@ -1,7 +1,4 @@
 import os
-
-from sklearn.feature_selection import VarianceThreshold
-from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 
 #os.environ.setdefault("NUMBA_DISABLE_CUDA", "1")  # hard-disable CUDA in Numba
@@ -9,6 +6,7 @@ from threadpoolctl import threadpool_limits
 
 import numpy as np
 import pandas as pd
+
 from tsfresh import extract_features
 from tsfresh.feature_extraction.settings import (
     MinimalFCParameters,
@@ -16,7 +14,9 @@ from tsfresh.feature_extraction.settings import (
     ComprehensiveFCParameters,
 )
 from tsfresh.utilities.dataframe_functions import impute as tsf_impute
+
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers
 
 
@@ -25,7 +25,7 @@ class BaseVectorizer:
     """Vectorizers must expose: partial_fit(batch), transform(batch)."""
     def __init__(self):
         self.needs_two_pass = False
-        self.batch_data_points = 20_000_000
+        self.batch_data_points = 2_000_000
 
     def partial_fit(self, x: np.ndarray):
         """Optional fit; no-op by default to support pure-transform vectorizers."""
@@ -119,100 +119,190 @@ class TSFreshVectorizer(BaseVectorizer):
         return feats
 
 
+# ============================================================================
+# Autoencoder Vectorizer (1D-CNN, Chameleon-style)
+# ============================================================================
 class AutoencoderVectorizer(BaseVectorizer):
+    # ============================================================================
+    # Convolutional Block (Chameleon style)
+    # ============================================================================
+    @staticmethod
+    def _conv_block(x, filters):
+        y = layers.Conv1D(filters, kernel_size=64, strides=1, padding="same")(x)
+        #y = layers.BatchNormalization()(y)
+        #y = layers.LayerNormalization()(y)
+        y = layers.GroupNormalization(groups=8, axis=-1, epsilon=1e-5)(y)
+        y = layers.ReLU()(y)
+        return y
+
+    # ============================================================================
+    # Residual Block (two conv blocks + skip, with 1x1 Conv for shortcut if needed)
+    # ============================================================================
+    @classmethod
+    def _residual_block(cls, x, filters):
+        shortcut = x
+        y = cls._conv_block(x, filters)
+        y = cls._conv_block(y, filters)
+
+        # Adjust shortcut channels if they differ
+        if shortcut.shape[-1] != filters:
+            shortcut = layers.Conv1D(filters, kernel_size=1, padding="same")(shortcut)
+
+        return layers.Add()([shortcut, y])
     """
-    Vectorizer using a 1D-CNN Autoencoder based on Chameleon CNN layers.
+    1D-CNN Autoencoder using Chameleon CNN encoder.
     Produces feature vectors consisting of:
        - reconstruction error
        - latent vector (optional)
     """
-
-    def __init__(self, window_size, latent_dim=16, include_latent=True):
+    def __init__(
+            self,
+            window_size,
+            include_errors: bool = False,
+            subsample_fraction: float = 0.15,
+            base_lr: float = 1e-3,
+            lr_decay: float = 0.7,
+    ):
         super().__init__()
-        self.batch_data_points = 500_000_000
+        self.batch_data_points = 3_000_000
         self.window_size = window_size
-        self.latent_dim = latent_dim
-        self.include_latent = include_latent
+        self.include_errors = include_errors
 
-        # ===========================
-        # Encoder (CNN)
-        # ===========================
-        inp = layers.Input(shape=(window_size, 1))  # 1D signal
+        self.subsample_fraction = subsample_fraction
+        self.base_lr = base_lr
+        self.lr_decay = lr_decay
+        self.current_epoch = 0
 
-        x = layers.Conv1D(16, kernel_size=5, strides=2, padding="same", activation="relu")(inp)
-        x = layers.Conv1D(32, kernel_size=5, strides=2, padding="same", activation="relu")(x)
-        x = layers.Conv1D(64, kernel_size=5, strides=2, padding="same", activation="relu")(x)
-        x = layers.Flatten()(x)
+        with tf.device("/GPU:0"):
+            inp = layers.Input(shape=(window_size, 1))
 
-        encoded = layers.Dense(latent_dim, activation="relu")(x)
+            # ==============================
+            # ENCODER (Chameleon CNN)
+            # ==============================
+            x = self._conv_block(inp, 16)
+            x = self._residual_block(x, 16)
+            x = self._residual_block(x, 32)
+            x = layers.Flatten()(x)
+            latent = layers.Dense(32, activation="linear", name="latent")(x)
 
-        # ===========================
-        # Decoder (mirror of encoder)
-        # ===========================
-        x = layers.Dense((window_size // 8) * 64, activation="relu")(encoded)
-        x = layers.Reshape((window_size // 8, 64))(x)
+            # ==============================
+            # DECODER (mirror structure)
+            # ==============================
+            x = layers.Dense(self.window_size * 32)(latent)
+            x = layers.Reshape((self.window_size, 32))(x)
+            x = self._residual_block(x, 32)
+            x = self._residual_block(x, 16)
+            decoded = layers.Conv1D(
+                1,
+                kernel_size=1,
+                padding="same",
+                activation="linear",
+                name="decoded",
+            )(x)
 
-        x = layers.Conv1DTranspose(32, kernel_size=5, strides=2, padding="same", activation="relu")(x)
-        x = layers.Conv1DTranspose(16, kernel_size=5, strides=2, padding="same", activation="relu")(x)
-        decoded = layers.Conv1DTranspose(1, kernel_size=5, strides=2, padding="same", activation="linear")(x)
+            # ==============================
+            # BUILD MODELS
+            # ==============================
+            self.autoencoder = models.Model(inp, decoded)
+            self.encoder = models.Model(inp, latent)
+            self.autoencoder_both = models.Model(inp, [decoded, latent])
 
-        # ===========================
-        # Build models
-        # ===========================
-        self.autoencoder = models.Model(inp, decoded)
-        self.encoder = models.Model(inp, encoded)
+            self.autoencoder.compile(
+                loss="mse",
+                optimizer=optimizers.Adam(learning_rate=self.base_lr)
+            )
 
-        self.autoencoder.compile(
-            loss="mse",
-            optimizer=optimizers.Adam(learning_rate=1e-3)
-        )
-
-        self.needs_two_pass = True  # training required
+        self.needs_two_pass = True
         self._trained = False
 
-    # ==================================================================
-    # Training phase
-    # ==================================================================
+        self.total_error_sum = 0.0
+        self.total_error_count = 0
+        self.global_avg_error = 0.0
+
+
+    # ================================================================
+    # TRAINING
+    # ================================================================
     def partial_fit(self, windows: np.ndarray):
         """
-        Train autoencoder on window batches.
-        windows shape: (batch, window_size)
+        One gradient step on a batch of windows.
+        Applies subsampling if subsample_fraction < 1.0.
+        windows: np.ndarray of shape (B, L)
         """
-        windows = windows[..., np.newaxis]  # add channel dimension
+        if windows.size == 0:
+            return self
 
-        self.autoencoder.fit(
-            windows,
-            windows,
-            epochs=3,
-            batch_size=128,
-            verbose=0
-        )
+        # --- Subsample a fraction of windows (approx. global fraction) ---
+        if 0.0 < self.subsample_fraction < 1.0:
+            n = windows.shape[0]
+            k = max(1, int(np.ceil(n * self.subsample_fraction)))
+            idx = np.random.choice(n, size=k, replace=False)
+            windows = windows[idx]
+
+        # Keras expects (B, L, 1)
+        windows = windows[..., np.newaxis]
+
+        with tf.device("/GPU:0"):
+            windows_tf = tf.convert_to_tensor(windows, dtype=tf.float32)
+            loss = self.autoencoder.train_on_batch(windows_tf, windows_tf)
+        self.global_avg_error = loss
         self._trained = True
         return self
 
-    # ==================================================================
-    # Inference phase
-    # ==================================================================
+
+    # ================================================================
+    # FEATURE EXTRACTION
+    # ================================================================
     def transform(self, windows: np.ndarray) -> np.ndarray:
-        """
-        Converts windows into anomaly features:
-          - reconstruction error
-          - latent vector (optional)
-        """
         if not self._trained:
-            raise RuntimeError("AutoencoderVectorizer must be trained using partial_fit() before calling transform()!")
+            raise RuntimeError("Vectorizer must be trained before transform()!")
 
-        windows_cnn = windows[..., np.newaxis]
+        # (B, L, 1) on GPU
+        windows = windows[..., np.newaxis].astype(np.float32)
 
-        # Reconstruction
-        recon = self.autoencoder.predict(windows_cnn, verbose=0)
+        with tf.device("/GPU:0"):
+            windows_tf = tf.convert_to_tensor(windows, dtype=tf.float32)
 
-        # Mean squared error per window
-        errors = np.mean((windows_cnn - recon) ** 2, axis=(1, 2))
-        errors = errors.reshape(-1, 1)
+            # Forward pass on GPU
+            recon_tf, latent_tf = self.autoencoder_both(windows_tf, training=False)
 
-        if self.include_latent:
-            latent = self.encoder.predict(windows_cnn, verbose=0)
-            return latent
+            # Per-window MSE over time and channel dims
+            errors_tf = tf.reduce_mean(
+                tf.square(windows_tf - recon_tf),
+                axis=[1, 2],
+                keepdims=True,  # (B, 1)
+            )
 
-        return errors
+        # Back to NumPy
+        errors = errors_tf.numpy().astype(np.float32)
+        latent = latent_tf.numpy().astype(np.float32)
+
+        if self.include_errors:
+            return np.concatenate([errors, latent], axis=1)
+
+        mean_error = float(errors.mean())
+        self.total_error_sum += mean_error
+        self.total_error_count += 1
+        self.global_avg_error = self.total_error_sum / self.total_error_count
+
+        return latent
+
+        # ================================================================
+    # EPOCH HOOK (called from train_autoencoder)
+    # ================================================================
+    def on_epoch_start(self, epoch_idx: int):
+        self.current_epoch = epoch_idx
+        if self.lr_decay is None:
+            return
+        new_lr = self.base_lr * (self.lr_decay ** epoch_idx)
+        self.autoencoder.optimizer.learning_rate = new_lr
+
+
+    def on_epoch_end(self, epoch_idx: int):
+        """
+        Optional: reset running error stats at end of epoch.
+        This mirrors what train_autoencoder currently does.
+        """
+        self.total_error_sum = 0.0
+        self.total_error_count = 0
+        self.global_avg_error = 0.0
