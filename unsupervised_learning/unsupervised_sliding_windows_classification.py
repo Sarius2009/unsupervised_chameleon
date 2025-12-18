@@ -8,23 +8,23 @@ import gc
 import os
 from time import sleep
 
-import torch
-from torch import nn
+import h5py
 from tqdm import tqdm
 import numpy as np
 
-
 from CNN.build_dataset_chameleon import highpass
-import h5py
 
-from inference_pipeline.debug import loaderGt
 # Unsupervised components (vectorization + clustering)
 from unsupervised_learning.vectorization import BaseVectorizer
 from unsupervised_learning.classification import BaseClassifier
 
-import sys
-import numpy as np
 
+def loaderGt(chunk_file):
+    with h5py.File(chunk_file, 'r', libver='latest') as hf_chunk:
+        chunk_len = len(hf_chunk['metadata/ciphers/'].keys())
+        for n in range(0, chunk_len):
+            labels = hf_chunk[f'metadata/pinpoints/pinpoints_{n}']
+            yield labels[:]
 
 
 def saveClassification(segmentation: np.ndarray, output_file: str) -> None:
@@ -38,7 +38,6 @@ def saveClassification(segmentation: np.ndarray, output_file: str) -> None:
     output_file : str
         The file where the segmentation will be saved.
     """
-
     np.save(output_file, segmentation)
 
 
@@ -50,12 +49,211 @@ def _dataLoader(chunk_file):
             yield traces[:]
 
 
-# ======================================================================
-# Unsupervised sliding-window pipeline:
-#   1. extract fixed-size windows
-#   2. vectorize (TSFresh / autoencoder / other BaseVectorizer)
-#   3. cluster or classify vectors (KMeansClassifier / other BaseClassifier)
-# ======================================================================
+def classify_trace_unsupervised(
+        trace_file: str,
+        vectorizer: BaseVectorizer,
+        classifier: BaseClassifier,
+        stride: int,
+        window_size: int,
+        epochs,
+        tmp_folder,
+        batch_size: int = 2000,
+        stored_features_path: str = None,
+        limit_traces: int = 0 #For debugging, 0 = use all
+) -> np.ndarray:
+    """
+    Unsupervised sliding-window classification using a vectorizer and
+    an unsupervised classifier, modeling the original workflow as close as possible
+
+
+    Parameters
+    ----------
+    limit_traces
+    single_trace
+    epochs
+    stored_features_path
+    tmp_folder
+    skip_feature_extraction
+    trace_file : str
+        Path to HDF5 trace file (same format used in CNN pipeline).
+    vectorizer : BaseVectorizer
+        Window-level feature extractor
+    classifier : BaseClassifier
+        Unsupervised classifier
+    stride : int
+    window_size : int
+    batch_size : int, optional
+
+    Returns
+    -------
+    np.ndarray
+        For each trace, per-window scores.
+        Shape: (num_traces, num_windows, num_classes).
+        If classifier has predict_proba, scores are soft probabilities.
+        Otherwise, scores are one-hot encodings of predicted labels. (Not sure if this works with the further code)
+    """
+
+    with h5py.File(trace_file, "r", libver="latest") as hf_chunk:
+        total_traces = len(hf_chunk["metadata/ciphers/"].keys())
+
+    total_traces = total_traces if not limit_traces else min(limit_traces, total_traces)
+
+    per_trace_scores = []
+    feat_files = []          # list of npy file paths for each trace
+    #-------------------------------------------
+    # Skip vectorization a feature path is given
+    #-------------------------------------------
+    if stored_features_path is None:
+        # Optional first pass to train vectorizer
+        if vectorizer.needs_two_pass:
+            # Collect all raw windows, vectorizer.partial_fit on batches
+            _train_autoencoder(
+                vectorizer=vectorizer,
+                trace_file=trace_file,
+                window_size=window_size,
+                stride=stride,
+                batch_size=batch_size,
+                epochs=epochs,
+                total_traces=total_traces,
+            )
+
+        #---------------------
+        # Vectorize all traces
+        #---------------------
+        for trace_idx, trace in enumerate(tqdm(_dataLoader(trace_file), total=total_traces, colour="green", desc="Vectorizing traces")):
+            trace = highpass(trace, 0.001)
+            trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
+
+            feats_batches = []
+
+            for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
+                windows_arr = np.asarray(windows_batch).astype(np.float32)
+                feats_batch = vectorizer.transform(windows_arr)
+                feats_batches.append(feats_batch)
+
+            X = np.vstack(feats_batches)
+
+            #--------------------------------------------------------
+            # Store features for this trace on disk instead of in RAM
+            #--------------------------------------------------------
+            trace_feat_path = os.path.join(
+                tmp_folder, f"trace_{trace_idx}_feats.npy"
+            )
+            np.save(trace_feat_path, X)
+
+            feat_files.append(trace_feat_path)
+            del X, feats_batch, trace, windows_batch
+            gc.collect()
+            sleep(10)
+            if trace_idx >= total_traces-1:
+                break
+
+
+        if hasattr(vectorizer, "global_avg_error"):
+            print('Avg. reconstruction error:', vectorizer.global_avg_error)
+            with open('loss.txt', 'w') as f:
+                f.write(str(vectorizer.global_avg_error))
+    #-------------------------------
+    # Read stored features from disk
+    #-------------------------------
+    else:
+        for i in range(0, total_traces):
+            trace_feat_path = os.path.join(
+                tmp_folder, stored_features_path, f"trace_{i}_feats.npy"
+            )
+            feat_files.append(trace_feat_path)
+
+    #---------------------------------------------
+    # Create a disk-backed memmap for all features
+    #---------------------------------------------
+    total_windows = 0
+    feat_dim = None
+    trace_windows = []  # windows per trace, aligned with feat_files order
+
+    for path in feat_files:
+        X = np.load(path, mmap_mode="r")
+        trace_windows.append(X.shape[0])
+        total_windows += X.shape[0]
+        if feat_dim is None and X.shape[0] > 0:
+            feat_dim = X.shape[1]
+
+
+    all_X_path = os.path.join(tmp_folder, "all_X.mmap")
+    all_X = np.memmap(all_X_path, dtype=np.float32, mode="w+", shape=(total_windows, feat_dim))
+
+    offset = 0
+    for path in feat_files:
+        X = np.load(path, mmap_mode="r")
+        n = X.shape[0]
+        all_X[offset:offset+n] = X
+        offset += n
+
+    all_X.flush()
+
+    #--------------
+    # Fit classifier
+    #---------------
+    labels_path = os.path.join(tmp_folder, "all_labels.mmap")
+    labels = np.memmap(labels_path, dtype=np.int64, mode="w+", shape=(total_windows,))
+
+    trace_offsets = [0]
+    offset = 0
+
+    with h5py.File(trace_file, "r", libver="latest") as hf:
+        for trace_idx in range(total_traces):
+            trace_len = hf[f"data/traces/trace_{trace_idx}"].shape[0]
+            pinpoints = hf[f"metadata/pinpoints/pinpoints_{trace_idx}"][:]
+
+
+            labels_i = _window_labels_from_pinpoints(trace_len, pinpoints, window_size, stride)
+            n = labels_i.shape[0]
+
+            if n != trace_windows[trace_idx]:
+                raise ValueError(
+                    f"Trace {trace_idx}: labels windows {n} != feature windows {trace_windows[trace_idx]}"
+                )
+
+
+            labels[offset:offset+n] = labels_i
+            offset += n
+            trace_offsets.append(offset)
+            if trace_idx >= total_traces-1:
+                break
+
+    labels.flush()
+
+    classifier.fit(all_X, labels)
+
+    #-----------------
+    # Classify windows
+    #-----------------
+    metrics = []
+
+    for trace_idx, path in enumerate(tqdm(
+            feat_files,
+            total=len(feat_files),
+            colour="cyan",
+            desc="Classifying globally-fitted",
+    )):
+        X = np.load(path, mmap_mode="r")
+
+        scores = classifier.predict_proba(X) if hasattr(classifier, "predict_proba") else classifier.predict(X)
+        per_trace_scores.append(scores)
+
+        start, end = trace_offsets[trace_idx], trace_offsets[trace_idx + 1]
+        y_true = labels[start:end]
+        metrics.append(_window_metrics_from_scores(scores, y_true))
+        if trace_idx >= total_traces-1:
+            break
+
+    print(f'Precicion: {np.mean([m["precision"] for m in metrics], axis=0):.4f}')
+    print(f'Recall: {np.mean([m["recall"] for m in metrics], axis=0):.4f}')
+    print(f'F1: {np.mean([m["f1"] for m in metrics], axis=0):.4f}')
+    print(f'Balanced accuracy: {np.mean([m["balanced_accuracy"] for m in metrics], axis=0):.4f}')
+    if hasattr(classifier, "cluster_to_class_"):
+        print(f'Cluster-to-class mapping: {classifier.cluster_to_class_}')
+
+    return np.stack(per_trace_scores, axis=0)
 
 
 def _extract_fixed_windows(
@@ -107,246 +305,8 @@ def _extract_fixed_windows(
         yield windows_batch
 
 
-def _vectorize_in_batches(
-    windows: np.ndarray, vectorizer: BaseVectorizer, batch_size: int
-) -> np.ndarray:
-    """
-    Apply vectorizer.transform to windows in batches for memory efficiency.
-    windows: (N, L)
-    returns: (N, D)
-    """
-    N = windows.shape[0]
-    if N == 0:
-        return np.empty((0, 0), dtype=float)
 
-    feats = []
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        batch = windows[start:end]
-        feats_batch = vectorizer.transform(batch)
-        feats.append(feats_batch)
-    return np.vstack(feats)
-
-
-def classifyTrace_unsupervised(
-    trace_file: str,
-    vectorizer: BaseVectorizer,
-    classifier: BaseClassifier,
-    stride: int,
-    window_size: int,
-    epochs,
-    tmp_folder,
-    batch_size: int = 2000,
-    stored_features_path: str = None
-) -> np.ndarray:
-    """
-    Unsupervised sliding-window classification using a vectorizer and
-    an unsupervised classifier, modeling the original workflow as close as possible
-
-
-    Parameters
-    ----------
-    stored_features_path
-    tmp_folder
-    skip_feature_extraction
-    trace_file : str
-        Path to HDF5 trace file (same format used in CNN pipeline).
-    vectorizer : BaseVectorizer
-        Window-level feature extractor
-    classifier : BaseClassifier
-        Unsupervised classifier
-    stride : int
-    window_size : int
-    batch_size : int, optional
-
-    Returns
-    -------
-    np.ndarray
-        For each trace, per-window scores.
-        Shape: (num_traces, num_windows, num_classes).
-        If classifier has predict_proba, scores are soft probabilities.
-        Otherwise, scores are one-hot encodings of predicted labels. (Not sure if this works with the further code)
-    """
-
-    with h5py.File(trace_file, "r", libver="latest") as hf_chunk:
-        total_traces = len(hf_chunk["metadata/ciphers/"].keys())
-
-    per_trace_scores = []
-    feat_files = []          # list of npy file paths for each trace
-    if stored_features_path is None:
-        # Optional first pass to train vectorizer
-        if vectorizer.needs_two_pass:
-            # Collect all raw windows, vectorizer.partial_fit on batches
-            _train_autoencoder(
-                vectorizer=vectorizer,
-                trace_file=trace_file,
-                window_size=window_size,
-                stride=stride,
-                batch_size=batch_size,
-                epochs=epochs,        # or 2, 3, ... as you like
-            )
-
-
-
-        feat_dim = None          # feature dimension (D)
-        # Vectorize all traces (and classify if you can't store all vectors)
-        for trace_idx, trace in enumerate(tqdm(_dataLoader(trace_file), total=total_traces, colour="green", desc="Vectorizing traces" + (" and classifying" if classifier.fit_per_trace else ""))):
-            trace = highpass(trace, 0.001)
-            trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
-
-            feats_batches = []
-
-            for windows_batch in _extract_fixed_windows(trace, window_size, stride, batch_size):
-                windows_arr = np.asarray(windows_batch)
-                feats_batch = vectorizer.transform(windows_arr)  # shape (batch, D)
-                feats_batches.append(feats_batch)
-
-            X = np.vstack(feats_batches)
-
-            if classifier.fit_per_trace:
-                raise NotImplementedError('Per trace fitting was not updated')
-                if X.shape[0] == 0:
-                    # consistent empty output shape
-                    scores = np.zeros((0,3))
-                else:
-                    classifier.fit(X)
-                    if hasattr(classifier, "predict_proba"):
-                        scores = classifier.predict_proba(X)
-                    else:
-                        scores = classifier.predict(X)
-
-                per_trace_scores.append(scores)
-
-            else:
-                # Store features for this trace on disk instead of in RAM
-                trace_feat_path = os.path.join(
-                    tmp_folder, f"trace_{trace_idx}_feats.npy"
-                )
-                np.save(trace_feat_path, X)
-
-                feat_files.append(trace_feat_path)
-                if X.shape[0] > 0:
-                    feat_dim = X.shape[1] if feat_dim is None else feat_dim
-            del X, feats_batch, trace, windows_batch
-            gc.collect()
-            sleep(20)
-            gc.collect()
-            sleep(20)
-            gc.collect()
-        if hasattr(vectorizer, "global_avg_error"):
-            print('Avg. reconstruction error:', vectorizer.global_avg_error)
-            with open('loss.txt', 'w') as f:
-                f.write(str(vectorizer.global_avg_error))
-    else:
-        for i in range(0, 16):
-            trace_feat_path = os.path.join(
-                tmp_folder, stored_features_path, f"trace_{i}_feats.npy"
-            )
-            feat_files.append(trace_feat_path)
-
-    # Train classifier on all features from file (global fit)
-    if not classifier.fit_per_trace:
-
-        # Create a disk-backed memmap for all features
-        # Before creating the memmap
-
-        total_rows = 0
-        feat_dim = None
-        feat_dtype = None
-
-        for path in feat_files:
-            Xi = np.load(path, mmap_mode='r')  # memory-mapped, cheap
-            if Xi.size == 0:
-                continue
-
-            n_rows, d = Xi.shape
-            total_rows += n_rows
-
-            if feat_dim is None:
-                feat_dim = d
-            if feat_dtype is None:
-                feat_dtype = Xi.dtype
-
-        # Now you have total_rows, feat_dim and dtype
-        all_feats_path = os.path.join(tmp_folder, "all_feats.dat")
-        all_X = np.memmap(
-            all_feats_path,
-            dtype=feat_dtype,   # matches saved features
-            mode="w+",
-            shape=(total_rows, feat_dim),
-        )
-
-
-        # Fill memmap by streaming per-trace features from disk
-        offset = 0
-        for path in tqdm(
-                feat_files,
-                total=len(feat_files),
-                colour="magenta",
-                desc="Building all_X memmap",
-        ):
-            Xi = np.load(path).astype(np.float32, copy=False)  # load per-trace features
-            n_rows = Xi.shape[0]
-            all_X[offset : offset + n_rows, :] = Xi
-            offset += n_rows
-
-        # Fit  on disk-backed array
-        all_labels = []
-        offset = 0
-        for trace_idx, path in enumerate(feat_files):
-            Xi = np.load(path)              # shape (n_windows_i, D)
-
-            # load pinpoints for this trace
-            with h5py.File(trace_file, "r", libver="latest") as hf:
-                pinpoints = hf[f"metadata/pinpoints/pinpoints_{trace_idx}"][:]
-                trace_len = hf[f"data/traces/trace_{trace_idx}"].shape[0]
-
-            labels_i = window_labels_from_pinpoints(
-                trace_len=trace_len,
-                pinpoints=pinpoints,
-                window_size=window_size,
-                stride=stride,
-            )
-            assert labels_i.shape[0] == Xi.shape[0]
-
-            all_labels.append(labels_i)
-
-        labels = np.concatenate(all_labels).astype(int)
-        classifier.fit(all_X, labels)
-
-        metrics = []
-# Second pass: classify per trace by loading back each X from file
-        metrics = []
-
-        for trace_idx, path in enumerate(tqdm(
-                feat_files,
-                total=len(feat_files),
-                colour="cyan",
-                desc="Classifying globally-fitted",
-        )):
-            X = np.load(path)
-
-            if hasattr(classifier, "predict_proba"):
-                scores = classifier.predict_proba(X)
-            else:
-                scores = classifier.predict(X)
-
-            per_trace_scores.append(scores)
-            metrics.append(window_metrics_from_scores(scores, all_labels[trace_idx]))
-
-
-    print(f'Precicion: {np.mean([m["precision"] for m in metrics], axis=0):.4f}')
-    print(f'Recall: {np.mean([m["recall"] for m in metrics], axis=0):.4f}')
-    print(f'F1: {np.mean([m["f1"] for m in metrics], axis=0):.4f}')
-    print(f'Balanced accuracy: {np.mean([m["balanced_accuracy"] for m in metrics], axis=0):.4f}')
-    if hasattr(classifier, "cluster_to_class_"):
-        print(f'Cluster-to-class mapping: {classifier.cluster_to_class_}')
-
-    return np.stack(per_trace_scores, axis=0)
-
-
-
-def window_labels_from_pinpoints(
+def _window_labels_from_pinpoints(
         trace_len: int,
         pinpoints: np.ndarray,  # shape (N, 2) with columns [start, end]
         window_size: int,
@@ -363,7 +323,7 @@ def window_labels_from_pinpoints(
 
     win_starts = np.arange(num_windows) * stride
     win_ends = win_starts + window_size
-    min_overlap = 0.45 * window_size
+    min_overlap = 0.5 * window_size
 
     for s, e in pinpoints:
         s = int(s)
@@ -376,7 +336,7 @@ def window_labels_from_pinpoints(
         mask = overlap >= min_overlap
         labels[mask] = 1
 
-    #print(np.count_nonzero(labels == 0) / len(labels), 'noise windows found')
+    print(np.count_nonzero(labels == 0) / len(labels), 'noise windows found')
 
     return labels
 
@@ -387,15 +347,15 @@ def _train_autoencoder(
         window_size: int,
         stride: int,
         batch_size: int,
-        epochs: int = 1,
-):
-    with h5py.File(trace_file, "r", libver="latest") as hf_chunk:
-        total_traces = len(hf_chunk["metadata/ciphers/"].keys())
+        epochs: int,
+        total_traces: int,
 
-    runs = 1
+):
     for epoch in range(epochs):
         if hasattr(vectorizer, "on_epoch_start"):
             vectorizer.on_epoch_start(epoch)
+        if hasattr(vectorizer, "global_avg_error"):
+            old = vectorizer.global_avg_error
 
         pbar = tqdm(
             _dataLoader(trace_file),
@@ -404,50 +364,47 @@ def _train_autoencoder(
             desc=f"Autoencoder epoch {epoch+1}/{epochs}",
             dynamic_ncols=True
         )
-        if hasattr(vectorizer, "global_avg_error"):
-            old = vectorizer.global_avg_error
 
-        for trace in pbar:
+        for trace_idx, trace in enumerate(pbar):
 
-            # -----------------------------
+            # -------------
             # Preprocessing
-            # -----------------------------
+            # -------------
             trace = highpass(trace, 0.001)
             trace = (trace - np.mean(trace, axis=0)) / np.std(trace, axis=0)
+
+            subsample_mul = 1
+            if hasattr(vectorizer, "subsample_fraction"):
+                subsample_mul = 1/vectorizer.subsample_fraction
 
             # -----------------------------
             # Train on all windows in trace
             # -----------------------------
-            subsample_mul = 1
-            if hasattr(vectorizer, "subsample_fraction"):
-                subsample_mul = 1/vectorizer.subsample_fraction
             for windows_batch in _extract_fixed_windows(trace, window_size, stride, int(batch_size*subsample_mul)):
                 windows_arr = np.asarray(windows_batch, dtype="float32")
-                for i in range(runs):
-                    vectorizer.partial_fit(windows_arr)
-                    if runs > 1 and (i%100 == 0 or i == runs-1):
-                        print(f'Error at {i+1}/{runs}: {vectorizer.global_avg_error:.3f}')
-                runs = max(1, int(runs*0.9))
-                if runs < 200:
-                    runs = 1
+                vectorizer.partial_fit(windows_arr)
 
 
-            # -----------------------------
+            # --------------------------------
             # Store the error after this trace
-            # -----------------------------
+            # --------------------------------
             if hasattr(vectorizer, "global_avg_error"):
-
                 pbar.set_postfix({
                     "old_avg_err": f"{old:.4f}",
                     "avg_err": f"{vectorizer.global_avg_error:.4f}",
                 })
                 old = vectorizer.global_avg_error
+            if trace_idx >= total_traces-1:
+                break
 
         if hasattr(vectorizer, "on_epoch_end"):
             vectorizer.on_epoch_end(epoch)
 
+    if hasattr(vectorizer, "save_autoencoder"):
+        vectorizer.save_autoencoder()
 
-def window_metrics_from_scores(scores, y_true, positive_class=1, threshold=0.5):
+
+def _window_metrics_from_scores(scores, y_true, positive_class=1, threshold=0.5):
     y_true = np.asarray(y_true, dtype=int)
     scores = np.asarray(scores)
 
@@ -485,7 +442,3 @@ def window_metrics_from_scores(scores, y_true, positive_class=1, threshold=0.5):
         "balanced_accuracy": bal_acc,
         "y_score": y_score,
     }
-
-
-
-

@@ -8,34 +8,66 @@ from sklearn.metrics import pairwise_distances
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import VarianceThreshold
 
-
-import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 
-class BaseClassifier:
-    def __init__(self):
-        self.fit_per_trace = False
-        self.pipeline_ = Pipeline([
-            ("selector", VarianceThreshold(threshold=1e-4)),
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=2)),
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import VarianceThreshold
+
+def _build_feature_preproc(n_features: int, pca_latent_components = 2, pca_generic_components = 1):
+    # Generic block (works well for TSFresh)
+    generic = Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("var", VarianceThreshold()),  # safe default; drops constant cols
+        ("scale", StandardScaler()),
+        ("pca", PCA(n_components=pca_generic_components, random_state=0)),
+    ])
+
+    # Hack: 33 == [error + 32 latent]
+    if n_features == 33:
+        err_idx = [0]
+        latent_idx = list(range(1, 33))
+
+        err_pipe = Pipeline([
+            ("impute", SimpleImputer(strategy="median")),
+            ("log1p", FunctionTransformer(np.log1p, feature_names_out="one-to-one")),  # optional but recommended
+            ("scale", StandardScaler()),
         ])
-    def fit(self, X_batch: np.ndarray, y: np.ndarray) -> np.ndarray:
-        return self
-    def predict(self, X_batch: np.ndarray) -> np.ndarray:
-        raise NotImplementedError()
+
+        latent_pipe = Pipeline([
+            ("impute", SimpleImputer(strategy="median")),
+            ("scale", StandardScaler()),
+            ("pca", PCA(n_components=pca_latent_components, random_state=0)),
+        ])
+
+        return ColumnTransformer(
+            transformers=[
+                ("latent", latent_pipe, latent_idx),
+                ("err", err_pipe, err_idx),
+
+            ],
+            remainder="drop",
+            verbose_feature_names_out=False,
+        )
+
+    # Fallback: TSFresh / other feature sets
+    return generic
 
 
-def plot_after_pipeline(Xp, y=None, max_points=200_000):
+def _plot_after_pipeline(Xp, y=None, max_points=100_000, decision_radius=None):
     """
     Plot features after pipeline in 1D / 2D / 3D.
     Assumes pipeline ends in PCA with n_components <= 3.
     """
-
     d = Xp.shape[1]
     if d < 1 or d > 3:
         return
+    fig = plt.figure()
 
     # subsample for speed / readability
     if Xp.shape[0] > max_points:
@@ -44,42 +76,90 @@ def plot_after_pipeline(Xp, y=None, max_points=200_000):
         y = None if y is None else y[idx]
 
     if d == 1:
-        plt.figure()
         if y is None:
             plt.hist(Xp[:, 0], bins=200)
         else:
-            plt.hist(Xp[y == 1, 0], bins=200, alpha=0.5, label="class 1", color='lightblue')
-            plt.hist(Xp[y == 0, 0], bins=200, alpha=0.5, label="class 0", color='red')
+            x1 = Xp[y == 1, 0]
+            x0 = Xp[y == 0, 0]
+            plt.hist(x0, bins=200, alpha=0.5, label="class 1", color='lightblue')
+            plt.hist(x1, bins=200, alpha=0.5, label="class 0", color='red')
             plt.legend()
+
+            # scaled class 0
+            if len(x0) > 0 and len(x1) > 0:
+                scale = len(x1) / len(x0)
+                weights = np.full_like(x0, scale, dtype=float)
+
+                plt.hist(
+                    x0,
+                    bins=200,
+                    weights=weights,
+                    histtype="step",
+                    linewidth=2,
+                    label="class 0 (scaled)",
+                )
+
+            if decision_radius is not None:
+                plt.axvline(+decision_radius, color='black')
+                plt.axvline(-decision_radius)
         plt.xlabel("PC1")
 
     elif d == 2:
-        plt.figure()
+        plt.axis("equal")
         if y is None:
             plt.scatter(Xp[:, 0], Xp[:, 1], s=1)
         else:
             plt.scatter(Xp[y == 1, 0], Xp[y == 1, 1], s=1, label="class 1", alpha=1, color='lightblue')
             plt.scatter(Xp[y == 0, 0], Xp[y == 0, 1], s=1, label="class 0", alpha=0.1, c='red')
 
+            if decision_radius is not None:
+                t = np.linspace(0.0, 2.0 * np.pi, 512)
+                x = decision_radius * np.cos(t)
+                y_ = decision_radius * np.sin(t)
+                plt.plot(x, y_, color='black')
+
             plt.legend()
         plt.xlabel("PC1")
-        plt.ylabel("PC2")
+        plt.ylabel("PC2/Err")
 
-    else:  # d == 3
-        fig = plt.figure()
+    elif d == 3:  # d == 3
         ax = fig.add_subplot(111, projection="3d")
         if y is None:
             ax.scatter(Xp[:, 0], Xp[:, 1], Xp[:, 2], s=1)
         else:
-            ax.scatter(Xp[y == 1, 0], Xp[y == 1, 1], Xp[y == 1, 2], s=1, label="class 1", alpha=0.02, color='lightblue')
+            ax.scatter(Xp[y == 1, 0], Xp[y == 1, 1], Xp[y == 1, 2], s=1, label="class 1", alpha=0.1, color='lightblue')
             ax.scatter(Xp[y == 0, 0], Xp[y == 0, 1], Xp[y == 0, 2], s=1, label="class 0", alpha=1, c='red')
+
+            if decision_radius is not None:
+                u = np.linspace(0.0, 2.0 * np.pi, 64)
+                v = np.linspace(0.0, np.pi, 32)
+                uu, vv = np.meshgrid(u, v)
+
+                x = decision_radius * np.cos(uu) * np.sin(vv)
+                y_ = decision_radius * np.sin(uu) * np.sin(vv)
+                z = decision_radius * np.cos(vv)
+
+                ax.plot_wireframe(x, y_, z, color='black')
             ax.legend()
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
-        ax.set_zlabel("PC3")
+        ax.set_zlabel("PC3/Err")
 
     plt.tight_layout()
     plt.show()
+
+    return fig
+
+
+
+class BaseClassifier:
+    def __init__(self):
+        self.pipeline_ = None
+        self.post_pipeline_data = None
+    def fit(self, X_batch: np.ndarray, y: np.ndarray):
+        return self
+    def predict(self, X_batch: np.ndarray) -> np.ndarray:
+        raise NotImplementedError()
 
 
 class RadialThresholdClassifier(BaseClassifier):
@@ -98,14 +178,12 @@ class RadialThresholdClassifier(BaseClassifier):
     def __init__(self,
                  inner_class: int = 0,
                  outer_class: int = 1,
-                 radius_dims: int | None = None,      # None = use all dims
                  metric: str = "balanced_accuracy", # "f1" | "balanced_accuracy" | "youden"
-                 positive_label: int = 0,           # used only when metric="f1"
+                 positive_label: int = 1,           # used only when metric="f1"
                  prob_sharpness: float = 8.0):
         super().__init__()
         self.inner_class = int(inner_class)
         self.outer_class = int(outer_class)
-        self.radius_dims = radius_dims
         self.metric = metric
         self.positive_label = int(positive_label)
         self.prob_sharpness = float(prob_sharpness)
@@ -115,22 +193,30 @@ class RadialThresholdClassifier(BaseClassifier):
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         orig_features = X.shape[1]
+        self.pipeline_ = _build_feature_preproc(orig_features)
         Z = self.pipeline_.fit_transform(X)
         print(f"Feature dimension after pipeline: {Z.shape[1]}/{orig_features}")
-        plot_after_pipeline(Z, y)
 
-        r = self._radius(Z)
         y = np.asarray(y, dtype=int)
-
-        self.r0_ = self._choose_threshold(r, y)
+        if orig_features == 33:
+            self.r0_ =self.choose_radius_from_top_error(Z[:, :-1], Z[:, -1])
+        else:
+            r = self._radius(Z)
+            self.r0_ = self._choose_threshold(r, y)
+        _plot_after_pipeline(Z, y, decision_radius=self.r0_)
+        self.post_pipeline_data = (Z, y)
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         self._check_is_fitted()
         Z = self.pipeline_.transform(X)
-        r = self._radius(Z)
-
-        y_pred = np.where(r <= self.r0_, self.inner_class, self.outer_class)
+        if X.shape[1] == 33:
+            r = self._radius(Z[:, :-1])
+            err = Z[:, -1]
+            y_pred = np.where(r <= self.r0_, self.inner_class, self.outer_class)
+        else:
+            r = self._radius(Z)
+            y_pred = np.where(r <= self.r0_, self.inner_class, self.outer_class)
         return y_pred.astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -140,7 +226,11 @@ class RadialThresholdClassifier(BaseClassifier):
         """
         self._check_is_fitted()
         Z = self.pipeline_.transform(X)
-        r = self._radius(Z)
+        if X.shape[1] == 33:
+            r = self._radius(Z[:, :-1])
+            err = Z[:, -1]
+        else:
+            r = self._radius(Z)
 
         s = self.prob_sharpness
         p_inner = 1.0 / (1.0 + np.exp(-s * (self.r0_ - r)))
@@ -164,21 +254,56 @@ class RadialThresholdClassifier(BaseClassifier):
         if d < 1:
             raise ValueError("Pipeline output has < 1 dimension.")
 
-        if self.radius_dims is None:
-            use_d = d
-        else:
-            use_d = int(self.radius_dims)
-            if use_d < 1:
-                raise ValueError(f"radius_dims must be >= 1 or None, got {self.radius_dims}")
-            use_d = min(use_d, d)
-
-        self._used_dims_ = use_d
-        Zuse = Z[:, :use_d]
+        self._used_dims_ = d
+        Zuse = Z[:, :d]
         return np.linalg.norm(Zuse, axis=1)
 
     def _check_is_fitted(self):
         if self.r0_ is None:
             raise AttributeError("Model is not fitted yet. Call fit(X, y) first.")
+
+    @staticmethod
+    def choose_radius_from_top_error(
+            Z: np.ndarray,
+            err: np.ndarray,
+            top_err_frac: float = 0.10,
+            in_radius_frac: float = 0.95,
+            eps: float = 1e-12,
+    ) -> float:
+        """
+        Pick a radial threshold r0 using the highest-error windows.
+
+        Procedure:
+          1) Select the windows in the top `top_err_frac` by reconstruction error.
+          2) Compute radii r = ||Z||_2 for those windows (same dims as Z).
+          3) Choose r0 so that `in_radius_frac` of those radii are <= r0.
+
+        Returns
+        -------
+        r0 : float
+            The decision radius.
+        """
+        Z = np.asarray(Z)
+        err = np.asarray(err).reshape(-1)
+        if Z.shape[0] != err.shape[0]:
+            raise ValueError(f"Z and err must have same length: {Z.shape[0]} vs {err.shape[0]}")
+
+        n = err.shape[0]
+        k = int(np.ceil(n * top_err_frac))
+        k = max(k, 1)
+
+        # indices of top-k errors (fast, no full sort)
+        idx_top = np.argpartition(err, n - k)[n - k:]
+        Z_top = Z[idx_top]
+
+        # radii in the same feature space as Z
+        r = np.linalg.norm(Z_top, axis=1)
+
+        # radius containing `in_radius_frac` of top-error windows
+        r0 = float(np.quantile(r, in_radius_frac))
+
+        # avoid degenerate zero radius
+        return max(r0, eps)
 
     def _choose_threshold(self, r: np.ndarray, y: np.ndarray) -> float:
         r = np.asarray(r, dtype=float)
@@ -206,10 +331,6 @@ class RadialThresholdClassifier(BaseClassifier):
             if score > best_score:
                 best_score = score
                 best_t = float(t)
-
-        print(f"Chosen radius r0={best_t:.6f} using dims={self._used_dims_} with {self.metric}={best_score:.6f}")
-        return best_t
-
 
         print(f"Chosen radius r0={best_t:.6f} using dims={self._used_dims_} with {self.metric}={best_score:.6f}")
         return best_t
@@ -242,7 +363,6 @@ class RadialThresholdClassifier(BaseClassifier):
             recall    = TP0 / (TP0 + FN0) if (TP0 + FN0) else 0.0
 
         return (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-
 
 
 class KMeansClassifier(BaseClassifier):
@@ -321,9 +441,11 @@ class KMeansClassifier(BaseClassifier):
     # ---- BaseUnsupervisedClassifier API ----
     def fit(self, X: np.ndarray, y: np.ndarray):
         orig_features = X.shape[1]
+        self.pipeline_ = _build_feature_preproc(orig_features)
         X = self.pipeline_.fit_transform(X)
         print(f"Feature dimension after pipeline: {X.shape[1]}/{orig_features}")
-        plot_after_pipeline(X, y)
+        _plot_after_pipeline(X, y)
+        self.post_pipeline_data = (X, y)
 
         self.kmeans_.fit(X)
         self._assign_clusters_from_labels(X, y)
@@ -366,7 +488,7 @@ class KMeansClassifier(BaseClassifier):
 
         # Aggregate cluster probabilities into 2 class columns [0,1]
         n_samples = X.shape[0]
-        n_classes = len(self.classes_)  # should be 3
+        n_classes = len(self.classes_)  # should be 2
         proba = np.zeros((n_samples, n_classes), dtype=float)
 
         for kmeans_idx, cls in self.cluster_to_class_.items():
@@ -439,5 +561,3 @@ class KMeansClassifier(BaseClassifier):
                 mapping[k] = 1
 
         return mapping
-
-

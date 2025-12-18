@@ -1,8 +1,9 @@
 import os
 from threadpoolctl import threadpool_limits
+import json
 
 #os.environ.setdefault("NUMBA_DISABLE_CUDA", "1")  # hard-disable CUDA in Numba
-# os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide GPUs from CUDA runtime
+#os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide GPUs from CUDA runtime
 
 import numpy as np
 import pandas as pd
@@ -81,17 +82,18 @@ class TSFreshVectorizer(BaseVectorizer):
             # Assume user passed a tsfresh settings object
             self.fc_params = fc_params
 
+
+
     def transform(self, x: np.ndarray) -> np.ndarray:
         if x.ndim != 2:
             raise ValueError(
                 f"TSFreshVectorizer expects univariate windows shaped (B, L); got {x.shape}"
             )
         B, L = x.shape
-        x = x.astype(np.float32)
         if B == 0:
             return np.empty((0, 0), dtype=float)
 
-        # Long-format dataframe for tsfresh: columns (id, time, value)
+        # Long-format dataframe for tsfresh: columns (id, value)
         ids = np.repeat(np.arange(B, dtype=np.uint32), L)
         values = x.reshape(-1)
 
@@ -99,7 +101,7 @@ class TSFreshVectorizer(BaseVectorizer):
             {"id": ids, "value": values},
             copy=False,
         )
-        with threadpool_limits(limits=1):
+        with threadpool_limits(limits=4):
             feats = extract_features(
                 df,
                 column_id="id",
@@ -117,6 +119,7 @@ class TSFreshVectorizer(BaseVectorizer):
             feats = feats.reindex(range(B), copy=False)
         feats = feats.to_numpy(dtype=np.float32)
         return feats
+
 
 
 # ============================================================================
@@ -149,16 +152,17 @@ class AutoencoderVectorizer(BaseVectorizer):
             shortcut = layers.Conv1D(filters, kernel_size=1, padding="same")(shortcut)
 
         return layers.Add()([shortcut, y])
+
     """
     1D-CNN Autoencoder using Chameleon CNN encoder.
     Produces feature vectors consisting of:
-       - reconstruction error
-       - latent vector (optional)
+       - reconstruction error (optional)
+       - latent vector
     """
     def __init__(
             self,
             window_size,
-            include_errors: bool = False,
+            include_errors: bool = True,
             subsample_fraction: float = 0.15,
             base_lr: float = 1e-3,
             lr_decay: float = 0.7,
@@ -173,44 +177,43 @@ class AutoencoderVectorizer(BaseVectorizer):
         self.lr_decay = lr_decay
         self.current_epoch = 0
 
-        with tf.device("/GPU:0"):
-            inp = layers.Input(shape=(window_size, 1))
+        inp = layers.Input(shape=(window_size, 1))
 
-            # ==============================
-            # ENCODER (Chameleon CNN)
-            # ==============================
-            x = self._conv_block(inp, 16)
-            x = self._residual_block(x, 16)
-            x = self._residual_block(x, 32)
-            x = layers.Flatten()(x)
-            latent = layers.Dense(32, activation="linear", name="latent")(x)
+        # ==============================
+        # ENCODER (Chameleon CNN)
+        # ==============================
+        x = self._conv_block(inp, 16)
+        x = self._residual_block(x, 16)
+        x = self._residual_block(x, 32)
+        x = layers.Flatten()(x)
+        latent = layers.Dense(32, activation="linear", name="latent")(x)
 
-            # ==============================
-            # DECODER (mirror structure)
-            # ==============================
-            x = layers.Dense(self.window_size * 32)(latent)
-            x = layers.Reshape((self.window_size, 32))(x)
-            x = self._residual_block(x, 32)
-            x = self._residual_block(x, 16)
-            decoded = layers.Conv1D(
-                1,
-                kernel_size=1,
-                padding="same",
-                activation="linear",
-                name="decoded",
-            )(x)
+        # ==============================
+        # DECODER (mirror structure)
+        # ==============================
+        x = layers.Dense(self.window_size * 32)(latent)
+        x = layers.Reshape((self.window_size, 32))(x)
+        x = self._residual_block(x, 32)
+        x = self._residual_block(x, 16)
+        decoded = layers.Conv1D(
+            1,
+            kernel_size=1,
+            padding="same",
+            activation="linear",
+            name="decoded",
+        )(x)
 
-            # ==============================
-            # BUILD MODELS
-            # ==============================
-            self.autoencoder = models.Model(inp, decoded)
-            self.encoder = models.Model(inp, latent)
-            self.autoencoder_both = models.Model(inp, [decoded, latent])
+        # ==============================
+        # BUILD MODELS
+        # ==============================
+        self.autoencoder = models.Model(inp, decoded)
+        self.encoder = models.Model(inp, latent)
+        self.autoencoder_both = models.Model(inp, [decoded, latent])
 
-            self.autoencoder.compile(
-                loss="mse",
-                optimizer=optimizers.Adam(learning_rate=self.base_lr)
-            )
+        self.autoencoder.compile(
+            loss="mse",
+            optimizer=optimizers.Adam(learning_rate=self.base_lr)
+        )
 
         self.needs_two_pass = True
         self._trained = False
@@ -242,9 +245,7 @@ class AutoencoderVectorizer(BaseVectorizer):
         # Keras expects (B, L, 1)
         windows = windows[..., np.newaxis]
 
-        with tf.device("/GPU:0"):
-            windows_tf = tf.convert_to_tensor(windows, dtype=tf.float32)
-            loss = self.autoencoder.train_on_batch(windows_tf, windows_tf)
+        loss = self.autoencoder.train_on_batch(windows, windows)
         self.global_avg_error = loss
         self._trained = True
         return self
@@ -258,24 +259,17 @@ class AutoencoderVectorizer(BaseVectorizer):
             raise RuntimeError("Vectorizer must be trained before transform()!")
 
         # (B, L, 1) on GPU
-        windows = windows[..., np.newaxis].astype(np.float32)
+        windows = windows[..., np.newaxis]
 
-        with tf.device("/GPU:0"):
-            windows_tf = tf.convert_to_tensor(windows, dtype=tf.float32)
 
-            # Forward pass on GPU
-            recon_tf, latent_tf = self.autoencoder_both(windows_tf, training=False)
+        # Forward pass on GPU
+        recon_tf, latent_tf = self.autoencoder_both(windows, training=False)
 
-            # Per-window MSE over time and channel dims
-            errors_tf = tf.reduce_mean(
-                tf.square(windows_tf - recon_tf),
-                axis=[1, 2],
-                keepdims=True,  # (B, 1)
-            )
+        errors = tf.reduce_mean(tf.square(windows - recon_tf), axis=(1, 2), keepdims=False).numpy().astype(np.float32)
+        errors = errors[:, None]
 
-        # Back to NumPy
-        errors = errors_tf.numpy().astype(np.float32)
         latent = latent_tf.numpy().astype(np.float32)
+
 
         if self.include_errors:
             return np.concatenate([errors, latent], axis=1)
@@ -287,8 +281,8 @@ class AutoencoderVectorizer(BaseVectorizer):
 
         return latent
 
-        # ================================================================
-    # EPOCH HOOK (called from train_autoencoder)
+    # ================================================================
+    # EPOCH HOOKS (called from train_autoencoder)
     # ================================================================
     def on_epoch_start(self, epoch_idx: int):
         self.current_epoch = epoch_idx
@@ -306,3 +300,69 @@ class AutoencoderVectorizer(BaseVectorizer):
         self.total_error_sum = 0.0
         self.total_error_count = 0
         self.global_avg_error = 0.0
+
+    def save_autoencoder(self, folder: str = 'ae_model/'):
+
+        os.makedirs(folder, exist_ok=True)
+
+        # Save the full model that outputs (decoded, latent)
+        self.autoencoder_both.save(os.path.join(folder, "autoencoder_both.keras"), include_optimizer=False)
+
+        # Save metadata needed to reconstruct the vectorizer consistently
+        meta = {
+            "window_size": int(self.window_size),
+            "include_errors": bool(self.include_errors),
+            "subsample_fraction": float(self.subsample_fraction),
+            "base_lr": float(self.base_lr),
+            "lr_decay": float(self.lr_decay),
+            "current_epoch": int(self.current_epoch),
+            "_trained": bool(self._trained),
+        }
+        with open(os.path.join(folder, "meta.json"), "w") as f:
+            json.dump(meta, f)
+
+        # Optional: persist running stats (not required for transform correctness)
+        stats = {
+            "total_error_sum": float(self.total_error_sum),
+            "total_error_count": int(self.total_error_count),
+            "global_avg_error": float(self.global_avg_error),
+        }
+        with open(os.path.join(folder, "stats.json"), "w") as f:
+            json.dump(stats, f)
+
+
+    @classmethod
+    def load_autoencoder(cls, folder: str = 'ae_model/'):
+        with open(os.path.join(folder, "meta.json"), "r") as f:
+            meta = json.load(f)
+
+        v = cls(
+            window_size=meta["window_size"],
+            include_errors=meta["include_errors"],
+            subsample_fraction=meta["subsample_fraction"],
+            base_lr=meta["base_lr"],
+            lr_decay=meta["lr_decay"],
+        )
+
+        # Load saved model
+        v.autoencoder_both = tf.keras.models.load_model(os.path.join(folder, "autoencoder_both.keras"))
+
+        # Recreate derived models from the loaded graph
+        v.autoencoder = tf.keras.Model(v.autoencoder_both.input, v.autoencoder_both.outputs[0])
+        v.encoder     = tf.keras.Model(v.autoencoder_both.input, v.autoencoder_both.outputs[1])
+
+        # Mark trained state
+        v._trained = bool(meta.get("_trained", True))
+        v.current_epoch = int(meta.get("current_epoch", 0))
+
+        # Optional stats restore
+        stats_path = os.path.join(folder, "stats.json")
+        if os.path.exists(stats_path):
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+            v.total_error_sum = float(stats.get("total_error_sum", 0.0))
+            v.total_error_count = int(stats.get("total_error_count", 0))
+            v.global_avg_error = float(stats.get("global_avg_error", 0.0))
+
+        return v
+
