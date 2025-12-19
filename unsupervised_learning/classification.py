@@ -1,6 +1,7 @@
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
+from scipy.special import expit
 
 from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances
@@ -19,7 +20,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import VarianceThreshold
 
-def _build_feature_preproc(n_features: int, pca_latent_components = 2, pca_generic_components = 1):
+def _build_feature_preproc(n_features: int, pca_latent_components = 2, pca_generic_components = 33):
     # Generic block (works well for TSFresh)
     generic = Pipeline([
         ("impute", SimpleImputer(strategy="median")),
@@ -59,19 +60,68 @@ def _build_feature_preproc(n_features: int, pca_latent_components = 2, pca_gener
     return generic
 
 
-def _plot_after_pipeline(Xp, y=None, max_points=100_000, decision_radius=None):
+def _plot_after_pipeline(Xp, y=None, max_points=30_000, decision_radius=None):
     """
     Plot features after pipeline in 1D / 2D / 3D.
     Assumes pipeline ends in PCA with n_components <= 3.
     """
+
+    def _set_robust_limits(ax, X, q=0.05, pad=0.60):
+        lo, hi = q, 1.0 - q
+
+        def _pad_lim(lim):
+            a, b = float(lim[0]), float(lim[1])
+            w = b - a
+            if w <= 0:
+                w = 1.0  # fallback for degenerate cases
+            m = pad * w
+            return (a - m, b + m)
+
+        xlim = np.quantile(X[:, 0], [lo, hi])
+        ax.set_xlim(_pad_lim(xlim))
+
+        if X.shape[1] >= 2:
+            ylim = np.quantile(X[:, 1], [lo, hi])
+            ax.set_ylim(_pad_lim(ylim))
+
+        if X.shape[1] >= 3 and hasattr(ax, "set_zlim"):
+            zlim = np.quantile(X[:, 2], [lo, hi])
+            ax.set_zlim(_pad_lim(zlim))
+
     d = Xp.shape[1]
     if d < 1 or d > 3:
         return
     fig = plt.figure()
 
     # subsample for speed / readability
+    # subsample for speed / readability (balanced if y is provided)
     if Xp.shape[0] > max_points:
-        idx = np.random.choice(Xp.shape[0], max_points, replace=False)
+        if y is None:
+            idx = np.random.choice(Xp.shape[0], max_points, replace=False)
+        else:
+            y = np.asarray(y)
+            idx0 = np.flatnonzero(y == 0)
+            idx1 = np.flatnonzero(y == 1)
+
+            half = max_points // 2
+            n0 = min(len(idx0), half)
+            n1 = min(len(idx1), half)
+
+            sel0 = np.random.choice(idx0, n0, replace=False) if n0 > 0 else np.array([], dtype=int)
+            sel1 = np.random.choice(idx1, n1, replace=False) if n1 > 0 else np.array([], dtype=int)
+
+            idx = np.concatenate([sel0, sel1])
+
+            # if we couldn't reach max_points due to class imbalance, top up from remaining points
+            remaining = max_points - idx.size
+            if remaining > 0:
+                pool = np.setdiff1d(np.arange(Xp.shape[0]), idx, assume_unique=False)
+                if pool.size > 0:
+                    extra = np.random.choice(pool, min(remaining, pool.size), replace=False)
+                    idx = np.concatenate([idx, extra])
+
+            np.random.shuffle(idx)
+
         Xp = Xp[idx]
         y = None if y is None else y[idx]
 
@@ -81,9 +131,8 @@ def _plot_after_pipeline(Xp, y=None, max_points=100_000, decision_radius=None):
         else:
             x1 = Xp[y == 1, 0]
             x0 = Xp[y == 0, 0]
-            plt.hist(x0, bins=200, alpha=0.5, label="class 1", color='lightblue')
-            plt.hist(x1, bins=200, alpha=0.5, label="class 0", color='red')
-            plt.legend()
+            plt.hist(x1, bins=200, alpha=0.5, label="class 1", color='lightblue')
+            plt.hist(x0, bins=200, alpha=0.5, label="class 0", color='red')
 
             # scaled class 0
             if len(x0) > 0 and len(x1) > 0:
@@ -98,19 +147,20 @@ def _plot_after_pipeline(Xp, y=None, max_points=100_000, decision_radius=None):
                     linewidth=2,
                     label="class 0 (scaled)",
                 )
+            plt.legend()
 
             if decision_radius is not None:
-                plt.axvline(+decision_radius, color='black')
-                plt.axvline(-decision_radius)
-        plt.xlabel("PC1")
+                plt.axvline(+decision_radius)
+                #plt.axvline(-decision_radius)
+        _set_robust_limits(plt.gca(), Xp[:, [0]])
+        plt.xlabel("Err")
 
     elif d == 2:
-        plt.axis("equal")
         if y is None:
             plt.scatter(Xp[:, 0], Xp[:, 1], s=1)
         else:
-            plt.scatter(Xp[y == 1, 0], Xp[y == 1, 1], s=1, label="class 1", alpha=1, color='lightblue')
-            plt.scatter(Xp[y == 0, 0], Xp[y == 0, 1], s=1, label="class 0", alpha=0.1, c='red')
+            plt.scatter(Xp[y == 0, 0], Xp[y == 0, 1], s=1, label="class 0", alpha=0.02, c='red')
+            plt.scatter(Xp[y == 1, 0], Xp[y == 1, 1], s=1, label="class 1", alpha=0.03, color='lightblue')
 
             if decision_radius is not None:
                 t = np.linspace(0.0, 2.0 * np.pi, 512)
@@ -119,16 +169,19 @@ def _plot_after_pipeline(Xp, y=None, max_points=100_000, decision_radius=None):
                 plt.plot(x, y_, color='black')
 
             plt.legend()
+        ax = plt.gca()
+        _set_robust_limits(ax, Xp)
+        ax.set_aspect("equal", adjustable="box")
         plt.xlabel("PC1")
-        plt.ylabel("PC2/Err")
+        plt.ylabel("PC2")
 
     elif d == 3:  # d == 3
         ax = fig.add_subplot(111, projection="3d")
         if y is None:
             ax.scatter(Xp[:, 0], Xp[:, 1], Xp[:, 2], s=1)
         else:
+            ax.scatter(Xp[y == 0, 0], Xp[y == 0, 1], Xp[y == 0, 2], s=1, label="class 0", alpha=0.2, c='red')
             ax.scatter(Xp[y == 1, 0], Xp[y == 1, 1], Xp[y == 1, 2], s=1, label="class 1", alpha=0.1, color='lightblue')
-            ax.scatter(Xp[y == 0, 0], Xp[y == 0, 1], Xp[y == 0, 2], s=1, label="class 0", alpha=1, c='red')
 
             if decision_radius is not None:
                 u = np.linspace(0.0, 2.0 * np.pi, 64)
@@ -141,9 +194,10 @@ def _plot_after_pipeline(Xp, y=None, max_points=100_000, decision_radius=None):
 
                 ax.plot_wireframe(x, y_, z, color='black')
             ax.legend()
+        _set_robust_limits(ax, Xp)
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
-        ax.set_zlabel("PC3/Err")
+        ax.set_zlabel("PC3")
 
     plt.tight_layout()
     plt.show()
@@ -179,43 +233,62 @@ class RadialThresholdClassifier(BaseClassifier):
                  inner_class: int = 0,
                  outer_class: int = 1,
                  metric: str = "balanced_accuracy", # "f1" | "balanced_accuracy" | "youden"
-                 positive_label: int = 1,           # used only when metric="f1"
-                 prob_sharpness: float = 8.0):
+                 positive_label: int = 1,
+                 top_err_frac: float = 0.05,
+                 in_radius_frac: float = 0.8,
+                 err_quantile: float = 0.9,
+                 prob_sharpness: float = 8.0,
+                 err_sharpness: float = 8.0):
         super().__init__()
         self.inner_class = int(inner_class)
         self.outer_class = int(outer_class)
         self.metric = metric
         self.positive_label = int(positive_label)
         self.prob_sharpness = float(prob_sharpness)
+        self.err_quantile = float(err_quantile)
+        self.err_sharpness = float(err_sharpness)
+        self.top_err_frac = top_err_frac
+        self.in_radius_frac = in_radius_frac
 
         self.r0_ = None
         self._used_dims_ = None
+        self.err_thr_ = None  # NEW: learned error threshold
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         orig_features = X.shape[1]
         self.pipeline_ = _build_feature_preproc(orig_features)
-        Z = self.pipeline_.fit_transform(X)
-        print(f"Feature dimension after pipeline: {Z.shape[1]}/{orig_features}")
-
+        X = self.pipeline_.fit_transform(X)
         y = np.asarray(y, dtype=int)
+        self.post_pipeline_data = (X, y)
+
+        #print(f"Feature dimension after pipeline: {X.shape[1]}/{orig_features}")
+
+
         if orig_features == 33:
-            self.r0_ =self.choose_radius_from_top_error(Z[:, :-1], Z[:, -1])
+            r = self._radius(X[:, :-1])
+            #self.r0_ = self._choose_threshold(r, y)
+            self.r0_ =self.choose_radius_from_top_error(X[:, :-1], X[:, -1])
+            self.err_thr_ = float(np.quantile(X[:, -1], self.err_quantile))
+            print(f'Noise chosen radius: {self.r0_}, error threshold: {self.err_thr_}')
+            _plot_after_pipeline(X[:, :-1], y, decision_radius=self.r0_)
+            _plot_after_pipeline(X[:, -1:], y, decision_radius=self.err_thr_)
         else:
-            r = self._radius(Z)
+            r = self._radius(X)
             self.r0_ = self._choose_threshold(r, y)
-        _plot_after_pipeline(Z, y, decision_radius=self.r0_)
-        self.post_pipeline_data = (Z, y)
+            _plot_after_pipeline(X, y, decision_radius=self.r0_)
+
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         self._check_is_fitted()
-        Z = self.pipeline_.transform(X)
+        X = self.pipeline_.transform(X)
         if X.shape[1] == 33:
-            r = self._radius(Z[:, :-1])
-            err = Z[:, -1]
+            r = self._radius(X[:, :-1])
+            err = X[:, -1]
             y_pred = np.where(r <= self.r0_, self.inner_class, self.outer_class)
+            y_pred = np.where(err >= self.err_thr_, self.inner_class, y_pred).astype(int)
         else:
-            r = self._radius(Z)
+            r = self._radius(X)
             y_pred = np.where(r <= self.r0_, self.inner_class, self.outer_class)
         return y_pred.astype(int)
 
@@ -225,15 +298,25 @@ class RadialThresholdClassifier(BaseClassifier):
         Uses a smooth logistic around r0.
         """
         self._check_is_fitted()
-        Z = self.pipeline_.transform(X)
+        X = self.pipeline_.transform(X)
         if X.shape[1] == 33:
-            r = self._radius(Z[:, :-1])
-            err = Z[:, -1]
+            r = self._radius(X[:, :-1])
+            err = X[:, -1]
         else:
-            r = self._radius(Z)
-
+            r = self._radius(X)
+            err = None
         s = self.prob_sharpness
-        p_inner = 1.0 / (1.0 + np.exp(-s * (self.r0_ - r)))
+        p_inner_rad = 1.0 / (1.0 + np.exp(-s * (self.r0_ - r)))
+
+        if err is not None and self.err_thr_ is not None:
+            se = self.err_sharpness
+            p_inner_err = expit(se * (err - self.err_thr_))
+
+            # OR-like fusion toward inner_class
+            p_inner = 1.0 - (1.0 - p_inner_rad) * (1.0 - p_inner_err)
+        else:
+            p_inner = p_inner_rad
+
 
         proba = np.zeros((r.shape[0], 2), dtype=float)
         if self.inner_class == 0:
@@ -262,12 +345,10 @@ class RadialThresholdClassifier(BaseClassifier):
         if self.r0_ is None:
             raise AttributeError("Model is not fitted yet. Call fit(X, y) first.")
 
-    @staticmethod
     def choose_radius_from_top_error(
+            self,
             Z: np.ndarray,
             err: np.ndarray,
-            top_err_frac: float = 0.10,
-            in_radius_frac: float = 0.95,
             eps: float = 1e-12,
     ) -> float:
         """
@@ -289,7 +370,7 @@ class RadialThresholdClassifier(BaseClassifier):
             raise ValueError(f"Z and err must have same length: {Z.shape[0]} vs {err.shape[0]}")
 
         n = err.shape[0]
-        k = int(np.ceil(n * top_err_frac))
+        k = int(np.ceil(n * self.top_err_frac))
         k = max(k, 1)
 
         # indices of top-k errors (fast, no full sort)
@@ -300,7 +381,7 @@ class RadialThresholdClassifier(BaseClassifier):
         r = np.linalg.norm(Z_top, axis=1)
 
         # radius containing `in_radius_frac` of top-error windows
-        r0 = float(np.quantile(r, in_radius_frac))
+        r0 = float(np.quantile(r, self.in_radius_frac))
 
         # avoid degenerate zero radius
         return max(r0, eps)
@@ -310,7 +391,7 @@ class RadialThresholdClassifier(BaseClassifier):
         y = np.asarray(y, dtype=int)
 
         # Candidate thresholds = quantiles of r
-        n_candidates = 512  # tune: 256, 512, 1024, 2048
+        n_candidates = 2048  # tune: 256, 512, 1024, 2048
         qs = np.linspace(0.0, 1.0, n_candidates)
         candidates = np.quantile(r, qs)
 
@@ -318,7 +399,7 @@ class RadialThresholdClassifier(BaseClassifier):
         candidates = np.unique(candidates)
         if candidates.size == 1:
             t = float(candidates[0])
-            print(f"Chosen radius r0={t:.6f} (degenerate; all radii equal)")
+            #print(f"Chosen radius r0={t:.6f} (degenerate; all radii equal)")
             return t
 
         best_t = float(candidates[0])
@@ -332,7 +413,7 @@ class RadialThresholdClassifier(BaseClassifier):
                 best_score = score
                 best_t = float(t)
 
-        print(f"Chosen radius r0={best_t:.6f} using dims={self._used_dims_} with {self.metric}={best_score:.6f}")
+        #print(f"Chosen radius r0={best_t:.6f} using dims={self._used_dims_} with {self.metric}={best_score:.6f}")
         return best_t
 
     def _score_from_preds(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:

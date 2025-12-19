@@ -2,8 +2,7 @@ import os
 from threadpoolctl import threadpool_limits
 import json
 
-#os.environ.setdefault("NUMBA_DISABLE_CUDA", "1")  # hard-disable CUDA in Numba
-#os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide GPUs from CUDA runtime
+
 
 import numpy as np
 import pandas as pd
@@ -270,16 +269,15 @@ class AutoencoderVectorizer(BaseVectorizer):
 
         latent = latent_tf.numpy().astype(np.float32)
 
-
-        if self.include_errors:
-            return np.concatenate([errors, latent], axis=1)
-
         mean_error = float(errors.mean())
         self.total_error_sum += mean_error
         self.total_error_count += 1
         self.global_avg_error = self.total_error_sum / self.total_error_count
 
-        return latent
+        if self.include_errors:
+            return np.concatenate([errors, latent], axis=1)
+        else:
+            return latent
 
     # ================================================================
     # EPOCH HOOKS (called from train_autoencoder)

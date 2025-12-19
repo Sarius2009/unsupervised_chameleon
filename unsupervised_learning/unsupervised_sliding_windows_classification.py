@@ -246,10 +246,16 @@ def classify_trace_unsupervised(
         if trace_idx >= total_traces-1:
             break
 
-    print(f'Precicion: {np.mean([m["precision"] for m in metrics], axis=0):.4f}')
-    print(f'Recall: {np.mean([m["recall"] for m in metrics], axis=0):.4f}')
-    print(f'F1: {np.mean([m["f1"] for m in metrics], axis=0):.4f}')
-    print(f'Balanced accuracy: {np.mean([m["balanced_accuracy"] for m in metrics], axis=0):.4f}')
+    print(f'Precision (CO): {np.mean([m["precision"] for m in metrics]):.4f}')
+    print(f'TPR (CO recall): '
+          f'{np.mean([m["TP"] / (m["TP"] + m["FN"]) if (m["TP"] + m["FN"]) else 0.0 for m in metrics]):.4f}')
+
+    print(f'TNR (boundary recall): '
+          f'{np.mean([m["TN"] / (m["TN"] + m["FP"]) if (m["TN"] + m["FP"]) else 0.0 for m in metrics]):.4f}')
+
+
+    print(f'Balanced accuracy: {np.mean([m["balanced_accuracy"] for m in metrics]):.4f}')
+
     if hasattr(classifier, "cluster_to_class_"):
         print(f'Cluster-to-class mapping: {classifier.cluster_to_class_}')
 
@@ -336,7 +342,7 @@ def _window_labels_from_pinpoints(
         mask = overlap >= min_overlap
         labels[mask] = 1
 
-    print(np.count_nonzero(labels == 0) / len(labels), 'noise windows found')
+    #print(np.count_nonzero(labels == 0) / len(labels), 'noise windows found')
 
     return labels
 
@@ -406,6 +412,7 @@ def _train_autoencoder(
 
 def _window_metrics_from_scores(scores, y_true, positive_class=1, threshold=0.5):
     y_true = np.asarray(y_true, dtype=int)
+    y_true_bin = (y_true == positive_class).astype(int)
     scores = np.asarray(scores)
 
     if scores.ndim == 2:
@@ -421,13 +428,14 @@ def _window_metrics_from_scores(scores, y_true, positive_class=1, threshold=0.5)
         y_pred = scores.astype(int)
         y_score = None
 
-    TP = np.count_nonzero((y_true == 1) & (y_pred == 1))
-    FP = np.count_nonzero((y_true == 0) & (y_pred == 1))
-    TN = np.count_nonzero((y_true == 0) & (y_pred == 0))
-    FN = np.count_nonzero((y_true == 1) & (y_pred == 0))
+    TP = np.count_nonzero((y_true_bin == 1) & (y_pred == 1))
+    FP = np.count_nonzero((y_true_bin == 0) & (y_pred == 1))
+    TN = np.count_nonzero((y_true_bin == 0) & (y_pred == 0))
+    FN = np.count_nonzero((y_true_bin == 1) & (y_pred == 0))
 
     precision = TP / (TP + FP) if (TP + FP) else 0.0
     recall    = TP / (TP + FN) if (TP + FN) else 0.0
+    recall_neg = TN / (TN + FP) if (TN + FP) else 0.0
     f1        = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
     bal_acc   = 0.5 * (
             (TP / (TP + FN) if (TP + FN) else 0.0) +
@@ -437,8 +445,10 @@ def _window_metrics_from_scores(scores, y_true, positive_class=1, threshold=0.5)
     return {
         "TP": TP, "FP": FP, "TN": TN, "FN": FN,
         "precision": precision,
-        "recall": recall,
+        "recall": recall,  # positive-class recall
+        "recall_neg": recall_neg,  # negative-class recall (specificity)
         "f1": f1,
         "balanced_accuracy": bal_acc,
         "y_score": y_score,
     }
+
